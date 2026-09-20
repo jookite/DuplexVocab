@@ -1,0 +1,96 @@
+[project]
+name = "polyplex_research"
+version = "1.0.0"
+description = "Data-efficient Multilingual Transfer for Duplex Spoken LMs"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "transformers>=5.14.1",
+    "numpy>=2.3.5",
+    "hf-xet>=1.1.8",
+]
+
+[project.optional-dependencies]
+preprocess = [
+    "sentencepiece>=0.2.2",
+    "protobuf>=4.25.0",
+    "pyloudnorm>=0.2.0",
+    "pyarrow>=21.0.0",
+]
+audio = [  # audio processing
+    "librosa>=0.11.0",
+    "soundfile>=0.13.1",
+]
+train = [
+    "accelerate>=1.1.0",
+    "nbconvert>=7.0.0",
+    "notebook>=7.4.5",
+    "ipykernel>=6.29.0",
+    "ipywidgets>=8.1.7",
+    "wandb>=0.17.0",
+]
+eval = [
+    "pyworld>=0.3.5",
+    "jiwer>=4.0.0",
+]
+
+[dependency-groups]
+cu128 = [
+    "torch>=2.11.0,<2.12.0",
+    "torchaudio>=2.11.0,<2.12.0",
+    "torchcodec>=0.11.0,<0.12.0",
+    "torchao>=0.17.0,<0.18.0",
+    "mslk>=1.1.1,<1.2.0",
+]
+cu126 = [
+    "torch>=2.11.0",
+    "torchaudio>=2.11.0",
+    "torchcodec>=0.13.0",
+    "torchao>=0.17.0",
+]
+dev = [
+    "pytest>=8.0.0",
+]
+ops = [
+    "researchtree>=1.3.0",
+    "letify>=2.9.0",
+    "wandb>=0.30.0",
+]
+
+[tool.uv]
+default-groups = ["dev", "ops", "cu128"]
+conflicts = [
+    [{ group = "cu126" }, { group = "cu128" }],
+]
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cu126", group = "cu126" },
+    { index = "pytorch-cu128", group = "cu128" },
+]
+torchaudio = [
+    { index = "pytorch-cu126", group = "cu126" },
+    { index = "pytorch-cu128", group = "cu128" },
+]
+torchcodec = [
+    { index = "pytorch-cu126", group = "cu126" },
+    { index = "pytorch-cu128", group = "cu128" },
+]
+torchao = [
+    { index = "pytorch-cu126", group = "cu126" },
+    { index = "pytorch-cu128", group = "cu128" },
+]
+mslk = [
+    { index = "pytorch-cu128", group = "cu128" },
+]
+transformers ={ git = "https://github.com/latentforge/transformers-moshi.git", branch = "feat/personaplex" }
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true

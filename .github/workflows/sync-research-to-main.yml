@@ -1,0 +1,120 @@
+# Keeps one pull request from `sync/main` into `main` up to date whenever `research` is pushed.
+#
+# The pull request carries the tree of `research` with the research-only documents removed: everything
+# under `docs/` except `docs/locales/` and `docs/references/`, and the root `AGENTS.md`. It is one commit,
+# meant to be merged with "Squash and merge". The commit is authored by the latest human author on
+# `research` and lists every other human author of the commits not yet on `main` as a co-author, so the
+# squashed commit on `main` credits the people who wrote the change.
+#
+# `sync/main` is written only by this workflow and is rebuilt from `main` on every run, so it is force-pushed.
+# That is the one exception to the no force push rule (AGENTS.md H12). An open pull request from it picks up
+# the new commit by itself; when none is open, one is created.
+#
+# The repository setting "Allow GitHub Actions to create and approve pull requests" must be on.
+
+name: Sync research to main
+
+on:
+  push:
+    branches: [research]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: sync-research-to-main
+  cancel-in-progress: false
+
+env:
+  BRANCH: sync/main
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the full history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Collect the human authors of the commits not yet on main
+        id: authors
+        run: |
+          set -euo pipefail
+          # One line per author email, newest first, without bots and AI agents.
+          git log --format='%an%x09%ae' origin/main..origin/research \
+            | grep -viE 'bot\]|noreply@anthropic\.com|^claude|github-actions' \
+            | awk -F'\t' '!seen[tolower($2)]++' > authors.tsv || true
+          if [ ! -s authors.tsv ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+          head -n1 authors.tsv | cut -f1 > author_name
+          head -n1 authors.tsv | cut -f2 > author_email
+          tail -n +2 authors.tsv | awk -F'\t' '{ printf "Co-authored-by: %s <%s>\n", $1, $2 }' > coauthors
+
+      - name: Build the main tree from research
+        if: steps.authors.outputs.skip == 'false'
+        id: build
+        run: |
+          set -euo pipefail
+          SHA="$(git rev-parse --short origin/research)"
+          echo "sha=${SHA}" >> "$GITHUB_OUTPUT"
+
+          git switch -C "$BRANCH" origin/main
+          # Make the index and the working tree exactly the tree of research.
+          git rm -rq --ignore-unmatch .
+          git checkout origin/research -- .
+
+          # Research-only documents stay off main.
+          if [ -d docs ]; then
+            find docs -mindepth 1 -maxdepth 1 ! -name locales ! -name references -exec git rm -rqf --ignore-unmatch {} +
+          fi
+          git rm -qf --ignore-unmatch AGENTS.md
+
+          if git diff --cached --quiet origin/main; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "Merge: Research ${SHA}"
+            echo
+            echo "Brings main up to research at ${SHA}, without the research-only documents."
+            if [ -s coauthors ]; then
+              echo
+              cat coauthors
+            fi
+          } > message
+
+          git -c user.name="$(cat author_name)" -c user.email="$(cat author_email)" \
+            commit -q --author="$(cat author_name) <$(cat author_email)>" -F message
+          git push -q --force origin "$BRANCH"
+
+      - name: Open the pull request or update it
+        if: steps.authors.outputs.skip == 'false' && steps.build.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ steps.build.outputs.sha }}
+        run: |
+          set -euo pipefail
+          {
+            echo "Brings \`main\` up to \`research\` at ${SHA}."
+            echo
+            echo "Removed from the tree: everything under \`docs/\` except \`docs/locales/\` and \`docs/references/\`, and \`AGENTS.md\`."
+            echo
+            echo "Merge with **Squash and merge** and keep the co-author lines below in the commit message, so the authors stay credited on \`main\`."
+            echo
+            cat coauthors
+          } > body
+
+          number="$(gh pr list --base main --head "$BRANCH" --state open --json number --jq '.[0].number // empty')"
+          if [ -z "$number" ]; then
+            gh pr create --base main --head "$BRANCH" --title "Merge: Research ${SHA}" --body-file body
+          else
+            gh pr edit "$number" --title "Merge: Research ${SHA}" --body-file body
+          fi

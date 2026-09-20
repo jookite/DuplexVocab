@@ -1,0 +1,4 @@
+root: research
+prefix: experiment/
+spec: docs/SPEC.md
+intent: docs/INTENT.md
