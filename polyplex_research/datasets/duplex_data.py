@@ -48,6 +48,9 @@ FRAMES_PER_PIECE = 4.119
 
 # Marks a colloquial transcript ends a word with, each of which costs the word a frame of its own.
 TRAILING_PUNCTUATION = ".,?!~…\"')]》」”’。？！"
+WHISPER_SAMPLE_RATE = 16000
+# Whisper's encoder emits one frame per 320 samples at 16 kHz.
+WHISPER_SECONDS_PER_FRAME = 0.02
 
 
 def split_trailing_punctuation(word: str) -> tuple:
@@ -357,6 +360,134 @@ def build_text_cache(
             if max_frames and frames > max_frames:
                 continue
             writer.add(example.target, starts, ends, np.repeat(frame, frames, axis=-1), f"text-{position:08d}")
+        return writer.count
+
+
+def dialogue_layout(
+    turns: list, tokenizer, max_frames: int = 1024, frames_per_piece: float = FRAMES_PER_PIECE
+) -> list:
+    r"""
+    Lays a dialogue out from one speaker's side: its own words at the nominal rhythm, and silence where the
+    other side speaks.
+
+    The text stream carries only what the followed speaker says, so a heard turn becomes a stretch of frames
+    with no word, as long as the nominal layout of its text. A dialogue that runs past `max_frames` is cut
+    before the own turn that does not fit, and the next sample opens on the turns heard since the last own
+    turn. An own turn longer than `max_frames` on its own is dropped.
+
+    Args:
+        turns (`list[DialogueTurn]`):
+            The dialogue in order.
+        tokenizer (`PreTrainedTokenizerBase`):
+            Tokenizer of the text stream, which decides how many pieces a word costs.
+        max_frames (`int`, *optional*, defaults to 1024):
+            Most frames a sample spans.
+        frames_per_piece (`float`, *optional*, defaults to 4.119):
+            Frames a piece occupies.
+
+    Returns:
+        `list[tuple]`: One `(words, starts, ends, frames)` per sample, with onsets and ends in seconds and
+        `frames` the end of the last own turn.
+    """
+    samples = []
+    words, starts, ends, cursor, heard = [], [], [], 0, 0
+
+    def flush():
+        # The heard turns after the last own one hold no word, so a sample ends with that own turn.
+        if words:
+            samples.append((list(words), list(starts), list(ends), cursor - heard))
+
+    for turn in turns:
+        turn_words = turn.text.split()
+        turn_starts, turn_ends, turn_frames = nominal_layout(turn_words, tokenizer, frames_per_piece)
+        if not turn.own:
+            cursor += turn_frames
+            heard += turn_frames
+            continue
+        if turn_frames > max_frames:
+            flush()
+            words, starts, ends, cursor, heard = [], [], [], 0, 0
+            continue
+        if cursor + turn_frames > max_frames:
+            flush()
+            words, starts, ends = [], [], []
+            cursor = heard if heard + turn_frames <= max_frames else 0
+        offset = cursor / FRAMES_PER_SECOND
+        words += turn_words
+        starts += [offset + start for start in turn_starts]
+        ends += [offset + end for end in turn_ends]
+        cursor += turn_frames
+        heard = 0
+    flush()
+    return samples
+
+
+def build_dialogue_cache(
+    dialogues,
+    model_dir: str,
+    output_dir: str,
+    max_frames: int = 1024,
+    exclude: set | None = None,
+    limit: int = 0,
+    frames_per_piece: float = FRAMES_PER_PIECE,
+    device: str = "cuda",
+    skip: int = 0,
+) -> int:
+    r"""
+    Writes a duplex cache of dialogues laid out by [`dialogue_layout`], with codec silence in the audio slots.
+
+    Args:
+        dialogues (`Iterable[list[DialogueTurn]]`):
+            The dialogues, for example from [`~multisession.iter_dialogues`].
+        model_dir (`str`):
+            Expanded checkpoint the processor is read from.
+        output_dir (`str`):
+            Directory the cache is written to.
+        max_frames (`int`, *optional*, defaults to 1024):
+            Most frames a sample spans.
+        exclude (`set`, *optional*):
+            Sentences that must not be trained on, such as an evaluation set. An own turn among them ends the
+            dialogue there, the way an unusable turn does.
+        limit (`int`, *optional*, defaults to 0):
+            Cap on samples, `0` for all.
+        frames_per_piece (`float`, *optional*, defaults to 4.119):
+            Frames a text piece stands for.
+        device (`str`, *optional*, defaults to `"cuda"`):
+            Device the codec runs on.
+        skip (`int`, *optional*, defaults to 0):
+            Samples passed over before the first one is written. With the same dialogues and `exclude`, a
+            cache built with `skip` equal to an earlier cache's `limit` starts right after that cache.
+
+    Returns:
+        `int`: Number of samples written.
+    """
+    from ..models.polyplex import PolyplexProcessor
+
+    processor = PolyplexProcessor.from_pretrained(model_dir)
+    frame = codec_silent_frame(processor, device)
+    exclude = exclude or set()
+    passed = 0
+
+    with DuplexCacheWriter(output_dir) as writer:
+        for dialogue in dialogues:
+            pieces, current = [], []
+            for turn in dialogue:
+                if turn.own and turn.text in exclude:
+                    pieces.append(current)
+                    current = []
+                    continue
+                current.append(turn)
+            pieces.append(current)
+            for piece in pieces:
+                if not any(turn.own for turn in piece):
+                    continue
+                for words, starts, ends, frames in dialogue_layout(piece, processor.tokenizer, max_frames, frames_per_piece):
+                    if passed < skip:
+                        passed += 1
+                        continue
+                    writer.add(" ".join(words), starts, ends, np.repeat(frame, frames, axis=-1))
+                    if limit and writer.count >= limit:
+                        return writer.count
         return writer.count
 
 
@@ -703,6 +834,189 @@ def dense_collate_fn(processor, model, silent_audio: bool = True):
     return collate
 
 
+def word_spans(ranges: list, token_starts: list, end: float) -> tuple:
+    r"""
+    Times each word by the tokens it was written with.
+
+    A word starts where its first token starts and ends where the next word's first token starts; the
+    last word ends at `end`.
+
+    Args:
+        ranges (`list` of `tuple`):
+            `(first, stop)` token indices of each word, in order and contiguous.
+        token_starts (`list` of `float`):
+            Start time of every token, in seconds.
+        end (`float`):
+            Time the last word ends at, such as the start of the end of text token.
+
+    Returns:
+        `tuple`: `(starts, ends)` per word, in seconds.
+    """
+    starts = [float(token_starts[first]) for first, _ in ranges]
+    ends = starts[1:] + [float(end)]
+    ends = [max(stop, start) for start, stop in zip(starts, ends)]
+    return starts, ends
+
+
+def whisper_alignment(
+    model, processor, waveforms: list, texts: list, device: str = "cuda", language: str = "ko"
+) -> list:
+    r"""
+    Times the words of known transcripts in their audio with Whisper's cross attention.
+
+    The transcript is fed to the decoder under teacher forcing, the cross attention of the checkpoint's
+    alignment heads is normalized per head and median filtered, and dynamic time warping over the token by
+    frame matrix gives each token the frame it starts on. This is how Whisper times its own words, applied
+    to the reference text instead of a decoded one, so recognition errors do not move the words.
+
+    Args:
+        model (`WhisperForConditionalGeneration`):
+            Recognizer with `generation_config.alignment_heads`, loaded with eager attention.
+        processor (`WhisperProcessor`):
+            Its processor.
+        waveforms (`list` of `numpy.ndarray`):
+            16 kHz mono clips of at most 30 seconds.
+        texts (`list` of `str`):
+            Transcripts, words separated by spaces.
+        device (`str`, *optional*, defaults to `"cuda"`):
+            Device the model is on.
+        language (`str`, *optional*, defaults to `"ko"`):
+            Whisper language code of the transcripts.
+
+    Returns:
+        `list` of `tuple`: `(starts, ends, loss)` per clip, the word times in seconds and the mean teacher
+        forced cross entropy of the transcript tokens.
+    """
+    from transformers.models.whisper.generation_whisper import _dynamic_time_warping, _median_filter
+
+    tokenizer = processor.tokenizer
+    prompt = tokenizer.convert_tokens_to_ids(
+        ["<|startoftranscript|>", f"<|{language}|>", "<|transcribe|>", "<|notimestamps|>"]
+    )
+    sequences, layouts = [], []
+    for text in texts:
+        ids, ranges = list(prompt), []
+        for word in text.split():
+            pieces = tokenizer.encode(" " + word, add_special_tokens=False)
+            ranges.append((len(ids), len(ids) + len(pieces)))
+            ids += pieces
+        ids.append(tokenizer.eos_token_id)
+        sequences.append(ids)
+        layouts.append(ranges)
+    longest = max(len(ids) for ids in sequences)
+    decoder_ids = torch.full((len(texts), longest), tokenizer.eos_token_id, dtype=torch.long)
+    for row, ids in enumerate(sequences):
+        decoder_ids[row, : len(ids)] = torch.tensor(ids)
+
+    features = processor(waveforms, sampling_rate=WHISPER_SAMPLE_RATE, return_tensors="pt", return_attention_mask=True)
+    with torch.no_grad():
+        # The encoder runs on its own so that only the decoder returns attention weights: the encoder's
+        # self attention over 1,500 frames would take tens of gigabytes per batch and is never read.
+        encoder_outputs = model.model.encoder(features.input_features.to(device, model.dtype))
+        output = model(
+            encoder_outputs=encoder_outputs,
+            decoder_input_ids=decoder_ids.to(device),
+            output_attentions=True,
+        )
+    heads = model.generation_config.alignment_heads
+    weights = torch.stack([output.cross_attentions[layer][:, head] for layer, head in heads], dim=1).float()
+    log_probs = output.logits.float().log_softmax(-1)
+
+    results = []
+    for row, (ids, ranges) in enumerate(zip(sequences, layouts)):
+        frames = int(features.attention_mask[row].sum()) // 2
+        matrix = weights[row, :, : len(ids), :frames]
+        std, mean = torch.std_mean(matrix, dim=-2, keepdim=True, unbiased=False)
+        matrix = _median_filter((matrix - mean) / (std + 1e-6), 7).mean(dim=0)
+        text_indices, time_indices = _dynamic_time_warping(-matrix.cpu().double().numpy())
+        jumps = np.pad(np.diff(text_indices), (1, 0), constant_values=1).astype(bool)
+        token_starts = time_indices[jumps] * WHISPER_SECONDS_PER_FRAME
+        starts, ends = word_spans(ranges, token_starts, token_starts[len(ids) - 1])
+        targets = torch.tensor(ids[len(prompt) :], device=log_probs.device)
+        loss = -log_probs[row, len(prompt) - 1 : len(ids) - 1].gather(-1, targets[:, None]).mean().item()
+        results.append((starts, ends, loss))
+    return results
+
+
+def read_texts(path: str) -> set:
+    r"""
+    Collects every sentence a dataset or cache file holds.
+
+    Args:
+        path (`str`):
+            A JSON lines file, or a folder whose JSON lines files are all read. A record contributes its
+            `target` or `text` field, and a JSON file holding a list of strings or of such records is
+            read as well.
+
+    Returns:
+        `set` of `str`: The sentences, with whitespace collapsed.
+    """
+    files = sorted(glob.glob(os.path.join(path, "*.jsonl"))) if os.path.isdir(path) else [path]
+    texts = set()
+    for file in files:
+        with open(file, encoding="utf-8") as handle:
+            if file.endswith(".json"):
+                records = json.load(handle)
+            else:
+                records = (json.loads(line) for line in handle if line.strip())
+            for record in records:
+                values = [record] if isinstance(record, str) else [
+                    value for key, value in record.items() if key in ("target", "text", "ko") and isinstance(value, str)
+                ]
+                texts.update(" ".join(value.split()) for value in values)
+    return texts
+
+
+def write_unseen_dataset(
+    conversation_root: str, translation: str, seen: list, output: str, seed: int = 0, translation_share: float = 0.3
+) -> int:
+    r"""
+    Writes a Phase 1 text dataset out of conversation turns and translation targets no listed file holds.
+
+    Args:
+        conversation_root (`str`):
+            Root of a conversation corpus between two people, read with [`iter_conversation_turns`].
+        translation (`str`):
+            Exported Phase 1 dataset whose `translation` records supply the Korean side.
+        seen (`list` of `str`):
+            Files or folders read with [`read_texts`], holding every sentence the model trained on or is
+            evaluated on.
+        output (`str`):
+            Folder the dataset is written to.
+        seed (`int`, *optional*, defaults to 0):
+            Seed of the shuffle and of the translation draw.
+        translation_share (`float`, *optional*, defaults to 0.3):
+            Share of translation targets in the written set. They are drawn at random down to that share, and
+            the rest stay unseen.
+
+    Returns:
+        `int`: Number of written examples.
+    """
+    from .multisession import iter_conversation_turns
+    from .phase_data import Phase1Example, build_unseen_dataset
+
+    excluded = set()
+    for path in seen:
+        excluded |= read_texts(path)
+    conversation = [
+        Phase1Example(target=turn.text, origin="conversation", domain=turn.topic, conversation=turn.conversation)
+        for turn in iter_conversation_turns(conversation_root, "train")
+    ]
+    with open(os.path.join(translation, "data.jsonl"), encoding="utf-8") as handle:
+        records = (json.loads(line) for line in handle if line.strip())
+        translated = [
+            Phase1Example(target=" ".join(record["target"].split()), origin="translation", domain=record.get("domain", ""))
+            for record in records
+            if record.get("origin") == "translation"
+        ]
+    conversation = build_unseen_dataset({"conversation": conversation}, excluded, seed).examples
+    translated = build_unseen_dataset({"translation": translated}, excluded | {e.target for e in conversation}, seed).examples
+    translated = translated[: round(len(conversation) * translation_share / (1 - translation_share))]
+    dataset = build_unseen_dataset({"conversation": conversation, "translation": translated}, excluded, seed)
+    dataset.save_pretrained(output)
+    return len(dataset)
+
+
 def main():
     r"""
     Command line: `text` writes a cache from a text dataset, `unseen` writes a text dataset of sentences
@@ -795,11 +1109,15 @@ __all__ = [
     "DuplexCacheWriter",
     "DuplexManifest",
     "DuplexUtteranceDataset",
+    "build_dialogue_cache",
     "build_text_cache",
     "codec_silent_frame",
     "dense_collate_fn",
+    "dialogue_layout",
     "duplex_collate_fn",
     "nominal_layout",
     "packed_words",
+    "read_texts",
     "text_stream",
+    "write_unseen_dataset",
 ]
