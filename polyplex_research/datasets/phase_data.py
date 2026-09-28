@@ -780,7 +780,104 @@ def phase2_collate_fn(
     return collate
 
 
+DENSE_TOKENS_NAME = "tokens.bin"
+DENSE_SEGMENTS_NAME = "segments.npy"
+DENSE_ROWS_NAME = "rows.npy"
+
+
+def write_dense_cache(
+    documents_path: str, tokenizer, output_dir: str, max_tokens: int = 1024, pieces: list | None = None
+) -> int:
+    r"""
+    Tokenizes a document corpus and packs it into rows for the dense stage of Phase 1.
+
+    Whitespace is collapsed to single spaces, since the text stream never carries a line break. Every
+    document becomes one or more segments, each costing its pieces plus the opening frame it is read after,
+    and the segments are packed in order into rows of at most `max_tokens` frames. A document longer than a
+    row is cut into consecutive segments. Nothing is repeated or dropped.
+
+    Args:
+        documents_path (`str`):
+            JSON lines file with one document per line under `text`.
+        tokenizer (`PreTrainedTokenizerBase`):
+            Tokenizer of the text stream.
+        output_dir (`str`):
+            Directory the cache is written to: the pieces end to end in `tokens.bin` (`int32`), each segment's
+            start and length in `segments.npy`, and each row's first segment in `rows.npy`.
+        max_tokens (`int`, *optional*, defaults to 1024):
+            Frames a row holds, opening frames included.
+        pieces (`list`, *optional*):
+            Pieces of every line of `documents_path`, in order, as `tokenizer` encodes the line's text with its
+            whitespace collapsed. When given, `tokenizer` is not called.
+
+    Returns:
+        `int`: Number of rows written.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    limit = max_tokens - 1
+    segments, rows = [], [0]
+    written, used = 0, 0
+    with open(os.path.join(output_dir, DENSE_TOKENS_NAME), "wb") as sink, open(documents_path, encoding="utf-8") as lines:
+        for index, line in enumerate(lines):
+            text = " ".join((json.loads(line).get("text") or "").split())
+            if not text:
+                continue
+            encoded = tokenizer.encode(text, add_special_tokens=False) if pieces is None else pieces[index]
+            np.asarray(encoded, dtype=np.int32).tofile(sink)
+            for start in range(0, len(encoded), limit):
+                length = min(limit, len(encoded) - start)
+                if used and used + length + 1 > max_tokens:
+                    rows.append(len(segments))
+                    used = 0
+                segments.append((written + start, length))
+                used += length + 1
+            written += len(encoded)
+    if used:
+        rows.append(len(segments))
+    np.save(os.path.join(output_dir, DENSE_SEGMENTS_NAME), np.asarray(segments, dtype=np.int64).reshape(-1, 2))
+    np.save(os.path.join(output_dir, DENSE_ROWS_NAME), np.asarray(rows, dtype=np.int64))
+    return len(rows) - 1
+
+
+class DenseTextDataset(Dataset):
+    r"""
+    Reads the rows [`write_dense_cache`] packs, one row per item.
+
+    Args:
+        cache_dir (`str`):
+            Directory holding `tokens.bin`, `segments.npy` and `rows.npy`.
+    """
+
+    def __init__(self, cache_dir: str):
+        self.cache_dir = cache_dir
+        self.tokens = np.memmap(os.path.join(cache_dir, DENSE_TOKENS_NAME), dtype=np.int32, mode="r")
+        self.segments = np.load(os.path.join(cache_dir, DENSE_SEGMENTS_NAME))
+        self.rows = np.load(os.path.join(cache_dir, DENSE_ROWS_NAME))
+
+    def __len__(self) -> int:
+        return len(self.rows) - 1
+
+    def __getitem__(self, index: int) -> dict:
+        first, last = self.rows[index], self.rows[index + 1]
+        return {
+            "segments": [
+                torch.from_numpy(np.asarray(self.tokens[start : start + length], dtype=np.int64))
+                for start, length in self.segments[first:last]
+            ]
+        }
+
+    def example_lengths(self) -> list:
+        r"""
+        Returns:
+            `list`: Frames of each row, opening frames included, for a sampler that groups by length.
+        """
+        per_segment = self.segments[:, 1] + 1
+        totals = np.concatenate([[0], np.cumsum(per_segment)])
+        return (totals[self.rows[1:]] - totals[self.rows[:-1]]).tolist()
+
+
 __all__ = [
+    "DenseTextDataset",
     "Phase1Dataset",
     "Phase1Example",
     "Phase2Dataset",
@@ -788,4 +885,5 @@ __all__ = [
     "phase1_collate_fn",
     "phase2_collate_fn",
     "text_frame_positions",
+    "write_dense_cache",
 ]
