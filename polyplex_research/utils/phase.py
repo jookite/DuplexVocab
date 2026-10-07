@@ -5245,6 +5245,450 @@ def dense_eval_main(args: list[str] | None = None) -> dict:
     )
 
 
+DENSE_INPUT_FILES = ("--alignment", "--removed-neurons", "--language-stream", "--shared-language-stream")
+DENSE_EVAL_INPUT_FILES = DENSE_INPUT_FILES + ("--training-tokens", "--speech-path")
+STORE_PREFIX = "store:"
+
+
+def stash_input_files(args: list[str], run_name: str, flags: tuple = DENSE_INPUT_FILES) -> list[str]:
+    r"""
+    Puts the local files a dense command line names ([`DENSE_INPUT_FILES`]) on the Drive store, so a run on a rented
+    machine can read them, and names them there instead: `--alignment <path>` becomes
+    `--alignment store:<run_name>-alignment`.
+
+    Args:
+        args (`list[str]`):
+            The arguments of [`dense_main`].
+        run_name (`str`):
+            Name of the run, the prefix of the store names.
+        flags (`tuple[str]`, *optional*, defaults to [`DENSE_INPUT_FILES`]):
+            The flags whose values are files.
+
+    Returns:
+        `list[str]`: The arguments with the files replaced by their store names.
+    """
+    import letify
+
+    args = list(args)
+    for flag in flags:
+        if flag in args and not args[args.index(flag) + 1].startswith(STORE_PREFIX):
+            index = args.index(flag) + 1
+            name = f"{run_name}-{flag.lstrip('-')}"
+            letify.stash(name, args[index])
+            logger.info("%s put on the Drive store as %s.", args[index], name)
+            args[index] = STORE_PREFIX + name
+    return args
+
+
+def fetch_input_file(value: str | None, directory: str) -> str | None:
+    r"""
+    Returns a local path for a file argument of [`dense_main`], fetching it from the Drive store when it names one
+    ([`stash_input_files`]).
+
+    Args:
+        value (`str`, *optional*):
+            A path, or `store:<name>`.
+        directory (`str`):
+            Directory a fetched file is written to.
+
+    Returns:
+        `str` or `None`: The local path, or `None` when `value` is.
+    """
+    if value is None or not value.startswith(STORE_PREFIX):
+        return value
+    import letify
+
+    name = value[len(STORE_PREFIX):]
+    os.makedirs(directory, exist_ok=True)
+    path = os.path.join(directory, name)
+    if letify.unstash(name, path) is None:
+        raise FileNotFoundError(f"The Drive store holds no {name!r}.")
+    return path
+
+
+def save_dense_result(result: dict, output_dir: str) -> None:
+    r"""
+    Writes the result of [`run_dense_adaptation`] to `result.json`. The trained weights are not part of it; they are
+    on the Drive store under the checkpoint the result names.
+
+    Args:
+        result (`dict`):
+            The result.
+        output_dir (`str`):
+            Directory written to.
+    """
+    import json
+
+    os.makedirs(output_dir, exist_ok=True)
+    with open(os.path.join(output_dir, "result.json"), "w", encoding="utf-8") as sink:
+        json.dump(result, sink, indent=2)
+
+
+def remote_secrets() -> dict:
+    r"""
+    Collects the credentials a run on a rented machine needs from this one: the Hugging Face token and the W&B
+    API key (from `WANDB_API_KEY` or `~/.netrc`).
+
+    Returns:
+        `dict`: `HF_TOKEN` and `WANDB_API_KEY`, each only when this machine has it.
+    """
+    import netrc
+
+    import huggingface_hub
+
+    secrets = {}
+    token = huggingface_hub.get_token()
+    if token:
+        secrets["HF_TOKEN"] = token
+    key = os.environ.get("WANDB_API_KEY")
+    if not key:
+        try:
+            entry = netrc.netrc(os.path.join(os.path.expanduser("~"), ".netrc")).authenticators("api.wandb.ai")
+        except (OSError, netrc.NetrcParseError):
+            entry = None
+        key = entry[2] if entry else None
+    if key:
+        secrets["WANDB_API_KEY"] = key
+    return secrets
+
+
+def package_archive() -> bytes:
+    r"""
+    Zips the Python sources of the `polyplex_research` package, without bytecode caches.
+
+    Returns:
+        `bytes`: The archive, with paths starting at `polyplex_research/`.
+    """
+    import io
+    import zipfile
+
+    package = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    parent = os.path.dirname(package)
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        for directory, subdirectories, files in os.walk(package):
+            subdirectories[:] = sorted(name for name in subdirectories if name != "__pycache__")
+            for name in sorted(files):
+                if name.endswith(".py"):
+                    path = os.path.join(directory, name)
+                    archive.write(path, os.path.relpath(path, parent))
+    return buffer.getvalue()
+
+
+def locked_extras(extras: tuple) -> list[str]:
+    r"""
+    Pins the packages of the project's optional dependency groups to the versions installed here.
+
+    Args:
+        extras (`tuple`):
+            Names of groups under `[project.optional-dependencies]` in `pyproject.toml`.
+
+    Returns:
+        `list[str]`: Requirements of the form `name==version`, one per package.
+    """
+    import importlib.metadata
+    import re
+    import tomllib
+
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    with open(os.path.join(root, "pyproject.toml"), "rb") as source:
+        groups = tomllib.load(source)["project"]["optional-dependencies"]
+    names = sorted({re.split(r"[<>=!~;\[ ]", requirement, maxsplit=1)[0] for extra in extras for requirement in groups[extra]})
+    return [f"{name}=={importlib.metadata.version(name)}" for name in names]
+
+
+def archive_runner():
+    r"""
+    Builds the function a remote letify call runs: it unpacks a package archive into a fresh directory, puts
+    that directory first on `sys.path`, drops the entries `PYTHONPATH` added, sets the given environment variables,
+    imports the entry point and calls it with the command line.
+
+    The function is defined inside this one, so cloudpickle sends it by value, and it uses the standard library
+    only, so it runs on a machine that does not have this package installed.
+
+    Returns:
+        `Callable`: `run(archive, module, function, args, secrets)`, returning what the entry point returns.
+    """
+
+    def run(archive: bytes, module: str, function: str, args: list, secrets: dict):
+        import importlib
+        import io
+        import os
+        import sys
+        import tempfile
+        import zipfile
+
+        # A host PYTHONPATH can name another interpreter's site-packages, which would shadow the locked environment
+        # in this process and in the compile workers it starts.
+        shadowing = {os.path.abspath(entry) for entry in os.environ.pop("PYTHONPATH", "").split(os.pathsep) if entry}
+        sys.path[:] = [entry for entry in sys.path if not entry or os.path.abspath(entry) not in shadowing]
+        root = tempfile.mkdtemp(prefix="letify-package-")
+        zipfile.ZipFile(io.BytesIO(archive)).extractall(root)
+        sys.path.insert(0, root)
+        os.environ.update(secrets)
+        # A path letify sent arrives as a path object; the entry points parse strings.
+        args = [os.fspath(arg) if isinstance(arg, os.PathLike) else arg for arg in args]
+        return getattr(importlib.import_module(module), function)(args)
+
+    return run
+
+
+def retry_lost_sessions(call, attempts: int = 5):
+    r"""
+    Calls `call` again when letify loses the session, up to `attempts` times in all.
+
+    A lost connection or a worker that dies while the session boots is retried. An exception raised by the run's
+    own code (`letify.errors.RemoteError`) is not.
+
+    Args:
+        call (`Callable`):
+            Starts the run and returns its result.
+        attempts (`int`, *optional*, defaults to 5):
+            Calls made at most.
+
+    Returns:
+        What `call` returns.
+
+    Raises:
+        letify.errors.LetifyError: The last session failure, once every attempt failed.
+    """
+    from letify.errors import ProtocolError, RuntimeFailure
+
+    for attempt in range(1, attempts + 1):
+        try:
+            return call()
+        except (ProtocolError, RuntimeFailure) as error:
+            if attempt == attempts:
+                raise
+            logger.warning("Session lost on attempt %d of %d, starting a new one: %s", attempt, attempts, error)
+
+
+def checkpoint_on_hub(run_name: str) -> bool:
+    r"""
+    Tells whether the public Hugging Face repository holds a checkpoint manifest of a run.
+
+    Args:
+        run_name (`str`):
+            Name of the run.
+
+    Returns:
+        `bool`: Whether `<run_name>/checkpoint/manifest.json` is in [`checkpoint_repo`].
+    """
+    from huggingface_hub import HfApi
+
+    try:
+        return HfApi().file_exists(checkpoint_repo(), f"{run_name}/checkpoint/manifest.json")
+    except Exception as error:
+        logger.info("%s could not be checked for a checkpoint of %s: %s", checkpoint_repo(), run_name, error)
+        return False
+
+
+def stored_checkpoint_exists(run_name: str) -> bool:
+    r"""
+    Tells whether a dense run has a checkpoint [`resume_checkpoint`] can read: on the local disk under
+    `$HF_HOME/runs/<run_name>/checkpoint-<step>` (or the older single `checkpoint`), on the Drive store, or on the public Hugging Face repository.
+
+    Args:
+        run_name (`str`):
+            Name of the run.
+
+    Returns:
+        `bool`: Whether any of them holds a checkpoint manifest of the run.
+    """
+    import tempfile
+    from pathlib import Path
+
+    import letify
+
+    runs = Path(os.environ.get("HF_HOME", ".cache/huggingface")) / "runs"
+    if local_checkpoints(runs / run_name):
+        return True
+    with tempfile.TemporaryDirectory() as directory:
+        try:
+            if letify.unstash(f"{run_name}-checkpoint", Path(directory) / "manifest.json") is not None:
+                return True
+        except Exception as error:
+            logger.info("The Drive store could not be checked for a checkpoint of %s: %s", run_name, error)
+    return checkpoint_on_hub(run_name)
+
+
+def resume_on_retry(args: list[str], run_name: str) -> list[str]:
+    r"""
+    Command line of a dense run started again after its session was lost: `--resume <run_name>` is added when the
+    run stored a checkpoint ([`stored_checkpoint_exists`]) and the command line names no `--resume` of its own, so
+    the run continues from its last checkpoint.
+
+    Args:
+        args (`list[str]`):
+            Command line arguments of [`dense_main`].
+        run_name (`str`):
+            Name of the run.
+
+    Returns:
+        `list[str]`: The command line for the retry.
+    """
+    if "--resume" in args or not stored_checkpoint_exists(run_name):
+        return args
+    logger.info("Resuming the retried run from the stored checkpoint of %s.", run_name)
+    return [*args, "--resume", run_name]
+
+
+def resolve_device(launcher, spec: str):
+    r"""
+    Turns a device spec into the letify instance a run is declared on.
+
+    Args:
+        launcher (`letify.Launcher`):
+            The launcher whose providers are searched.
+        spec (`str`):
+            `"<provider>.<accelerator>"`, for example `"local.RTX_PRO_6000"` or `"colab_pro_plus.G4"`. A bare
+            provider name takes its first accelerator, and the CPU only when it has none. A `*N` suffix, as in
+            `"lab_gpu.RTX_PRO_6000*2"`, takes N cards in one session (SPEC S13.4b).
+
+    Returns:
+        `letify.Instance`: The declared accelerator.
+
+    Raises:
+        letify.errors.UnknownInstance: If the provider does not offer the accelerator.
+    """
+    spec, _, count = spec.partition("*")
+    alias, _, accelerator = spec.partition(".")
+    provider = getattr(launcher.providers, alias)
+    if not accelerator:
+        names = [name for name in provider.discover() if name != "CPU"]
+        accelerator = names[0] if names else "CPU"
+    instance = getattr(provider, accelerator)
+    return instance * int(count) if count else instance
+
+
+def launch(args: list[str] | None = None):
+    r"""
+    Runs [`main`] on the accelerator `POLYPLEX_DEVICE` names, through letify.
+
+    The default, `"local"`, is the first GPU of this machine, where the call runs in a subprocess with this
+    environment. A remote provider takes the same declaration and ships the call to its machine, so a run
+    moves between the local card and a rented one by changing the variable alone.
+
+    A process started by `torchrun` with more than one worker runs [`main`] directly, since a letify call
+    holds a single GPU and the workers of a data parallel run have to share one process group.
+
+    A command line starting with `dense` runs [`dense_main`] instead, and its result is saved on this machine
+    under `$HF_HOME/runs/<run name>` with [`save_dense_result`]. One starting with `dense-eval` runs
+    [`dense_eval_main`], and its result is saved as `$HF_HOME/runs/<run name>-eval.json`. One starting with
+    `residual-alignment` runs that command of [`~polyplex_research.utils.assemble.main`], and the alignment comes back to
+    the directory of its `--output`. The Hugging Face token and the W&B key of this
+    machine are set in the run's process ([`remote_secrets`]), and the package is sent along ([`archive_runner`]).
+
+    Args:
+        args (`list[str]`, *optional*):
+            Command line arguments of [`main`], `sys.argv[1:]` when omitted.
+    """
+    import sys
+    from pathlib import Path
+
+    args = sys.argv[1:] if args is None else args
+    if int(os.environ.get("WORLD_SIZE", "1")) > 1:
+        # One process per GPU, started by torchrun, which has already chosen the device.
+        main(args)
+        return
+
+    import letify
+
+    launcher = letify.Launcher()
+    device = resolve_device(launcher, os.environ.get("POLYPLEX_DEVICE", "local"))
+    # A remote runtime installs the locked dependencies but not this project, so the package travels as an
+    # argument of the call, over the same channel as the call itself.
+    # A Colab session reached over tcp_punch sometimes drops its SSH connection while it boots.
+    # The runtime syncs the lock without extras, so the extras a run imports are installed at their locked versions.
+    env = letify.Env.from_lock().pip_install(*locked_extras(("preprocess", "audio", "train")))
+    run = launcher.function(device=device, host=letify.remote, env=env, retries=3)(archive_runner())
+    module = "polyplex_research.utils.phase"
+    if args[:1] == ["dense"]:
+        # The Hugging Face chunk cache keeps a second copy of every download, which the dense run's disk cannot hold.
+        environment = {**remote_secrets(), "HF_XET_CHUNK_CACHE_SIZE_BYTES": "0"}
+        # A local run inherits this process's environment, so the value is always set, never left to the shell.
+        environment["POLYPLEX_EPHEMERAL_DISK"] = "1" if ephemeral_disk(os.environ.get("POLYPLEX_DEVICE", "local")) else "0"
+        run_name = args[args.index("--run-name") + 1] if "--run-name" in args else "dual-ffn"
+        remote = os.environ.get("POLYPLEX_DEVICE", "local").partition(".")[0] != "local"
+        dense_args = stash_input_files(args[1:], run_name) if remote else args[1:]
+        if device.devices > 1:
+            dense_args = dense_args + ["--gpus", str(device.devices)]
+        # letify sends the files a call names by `Path` and copies back what the call adds there, so documents read
+        # once on any machine are not streamed again.
+        documents = Path(os.environ.get("HF_HOME", ".cache/huggingface"), "documents").absolute()
+        documents.mkdir(parents=True, exist_ok=True)
+        dense_args = dense_args + ["--document-cache", documents]
+        # The sources are read once, so a retried session runs the code the run started with.
+        archive = package_archive()
+        started = []
+
+        def dense_call():
+            call_args = resume_on_retry(dense_args, run_name) if started else dense_args
+            started.append(True)
+            return run(archive, module, "dense_main", call_args, environment)
+
+        result = retry_lost_sessions(dense_call)
+        output_dir = os.path.join(os.environ.get("HF_HOME", ".cache/huggingface"), "runs", run_name)
+        save_dense_result(result, output_dir)
+        logger.info("Dense result saved to %s", output_dir)
+        return
+    if args[:1] == ["residual-alignment"]:
+        # Passed by `Path`, so letify copies the alignment the call writes there back to this machine.
+        directory = Path(args[args.index("--output") + 1]).parent.absolute()
+        directory.mkdir(parents=True, exist_ok=True)
+        alignment_args = [*args, "--output-dir", directory]
+        retry_lost_sessions(
+            lambda: run(package_archive(), "polyplex_research.utils.assemble", "main", alignment_args, remote_secrets())
+        )
+        return
+    if args[:1] == ["dense-eval"]:
+        environment = {**remote_secrets(), "HF_XET_CHUNK_CACHE_SIZE_BYTES": "0"}
+        run_name = args[args.index("--run-name") + 1]
+        remote = os.environ.get("POLYPLEX_DEVICE", "local").partition(".")[0] != "local"
+        eval_args = stash_input_files(args[1:], run_name, DENSE_EVAL_INPUT_FILES) if remote else args[1:]
+        documents = Path(os.environ.get("HF_HOME", ".cache/huggingface"), "documents").absolute()
+        documents.mkdir(parents=True, exist_ok=True)
+        eval_args = eval_args + ["--document-cache", documents]
+        if "--release-dir" in eval_args:
+            # Passed by `Path`, so letify copies the saved release back to this machine.
+            index = eval_args.index("--release-dir") + 1
+            eval_args[index] = Path(eval_args[index]).absolute()
+            eval_args[index].mkdir(parents=True, exist_ok=True)
+        archive = package_archive()
+        result = retry_lost_sessions(lambda: run(archive, module, "dense_eval_main", eval_args, environment))
+        output = Path(os.environ.get("HF_HOME", ".cache/huggingface"), "runs", f"{run_name}-eval.json")
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(json.dumps(result, indent=2), encoding="utf-8")
+        logger.info("Dense evaluation saved to %s", output)
+        return
+    retry_lost_sessions(lambda: run(package_archive(), module, "main", args, remote_secrets()))
+
+
+def run_record(phase_args: PhaseArguments, train_size: int | None, eval_size: int | None, text_size: int | None) -> dict:
+    r"""
+    Collects what a W&B run needs beyond the trainer's own arguments.
+
+    Args:
+        phase_args (`PhaseArguments`):
+            The phase options, recorded in full under `phase/`.
+        train_size (`int`, *optional*):
+            Examples in the training set.
+        eval_size (`int`, *optional*):
+            Examples in the evaluation set.
+        text_size (`int`, *optional*):
+            Examples in the silent text set scored next to every batch.
+
+    Returns:
+        `dict`: The phase options, the data sizes that are known and the commit and branch of the checkout.
+    """
+    record = {f"phase/{key}": value for key, value in asdict(phase_args).items()}
+    for key, size in (("train", train_size), ("eval", eval_size), ("text", text_size)):
+        if size is not None:
+            record[f"record/{key}_data_size"] = size
+    record.update(git_record(os.path.dirname(os.path.abspath(__file__))))
+    return record
+
+
 def main(args: list[str] | None = None):
     r"""
     Parses the command line and runs the selected phase.
@@ -5419,6 +5863,7 @@ if __name__ == "__main__":
 
 __all__ = [
     "dense_mixture",
+    "archive_runner",
     "collect_english_states",
     "dense_documents",
     "dense_eval_rows",
@@ -5438,5 +5883,14 @@ __all__ = [
     "Phase1Trainer",
     "Phase2Trainer",
     "PhaseArguments",
+    "launch",
+    "locked_extras",
     "main",
+    "package_archive",
+    "remote_secrets",
+    "resolve_device",
+    "resume_on_retry",
+    "retry_lost_sessions",
+    "save_dense_result",
+    "stored_checkpoint_exists",
 ]
