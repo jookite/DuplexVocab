@@ -155,6 +155,168 @@ def per_codebook_einsum(depth: nn.Module):
             del module.forward
 
 
+class MixtureRows(torch.autograd.Function):
+    r"""
+    Builds each appended row as a weighted sum of the pretrained rows of its support.
+
+    $$w_i = \sum_{j=1}^{k} c_{ij}\, w_{s_{ij}}$$
+
+    The gather $w_{s}$ has `appended_rows * k * hidden` entries, which is far larger than either the
+    table it builds or the coefficients it is differentiated against, so it is never held whole: the
+    forward walks the vocabulary in chunks and the backward recomputes each chunk instead of saving it.
+    Autograd on the plain expression would keep every chunk alive until backward, which is what this
+    exists to avoid. Only the coefficients receive a gradient, since the pretrained rows are the fixed
+    basis the phase is constrained to.
+
+    Args:
+        weights (`torch.FloatTensor` of shape `(appended_rows, k)`):
+            The mixture coefficients, the only differentiable input.
+        pretrained (`torch.FloatTensor` of shape `(base_vocab_size, hidden_size)`):
+            The frozen rows the mixture is taken over.
+        support (`torch.LongTensor` of shape `(appended_rows, k)`):
+            Which pretrained rows each appended row mixes.
+        chunk (`int`):
+            How many appended rows are built at a time.
+
+    Returns:
+        `torch.FloatTensor` of shape `(appended_rows, hidden_size)`: The appended rows.
+    """
+
+    @staticmethod
+    def forward(ctx, weights, pretrained, support, chunk):
+        ctx.save_for_backward(pretrained, support)
+        ctx.chunk = chunk
+        rows = weights.new_empty((weights.shape[0], pretrained.shape[1]))
+        for start in range(0, weights.shape[0], chunk):
+            stop = start + chunk
+            gathered = pretrained[support[start:stop]].to(weights.dtype)
+            rows[start:stop] = torch.bmm(weights[start:stop].unsqueeze(1), gathered).squeeze(1)
+        return rows
+
+    @staticmethod
+    def backward(ctx, grad_rows):
+        pretrained, support = ctx.saved_tensors
+        grad_rows = grad_rows.contiguous()
+        grad_weights = grad_rows.new_empty(support.shape)
+        for start in range(0, support.shape[0], ctx.chunk):
+            stop = start + ctx.chunk
+            gathered = pretrained[support[start:stop]].to(grad_rows.dtype)
+            grad_weights[start:stop] = torch.bmm(
+                gathered, grad_rows[start:stop].unsqueeze(-1)
+            ).squeeze(-1)
+        return grad_weights, None, None, None
+
+
+class LoraLinear(nn.Module):
+    r"""
+    A frozen projection plus a low rank correction of it.
+
+    $$W_{\text{eff}} x = Wx + \frac{\alpha}{r} B A x$$
+
+    $B$ starts at zero, so the wrapped module answers exactly as it did before the first step.
+
+    Args:
+        wrapped (`nn.Linear`):
+            The pretrained projection, kept frozen.
+        rank (`int`):
+            Rank of the correction.
+        alpha (`float`):
+            Scale of the correction.
+    """
+
+    def __init__(self, wrapped: nn.Linear, rank: int, alpha: float):
+        super().__init__()
+        self.wrapped = wrapped
+        self.scaling = alpha / rank
+        self.down = nn.Parameter(torch.zeros(rank, wrapped.in_features, dtype=torch.float32))
+        self.up = nn.Parameter(torch.zeros(wrapped.out_features, rank, dtype=torch.float32))
+        nn.init.normal_(self.down, std=1 / rank)
+
+    def forward(self, hidden):
+        correction = (hidden.float() @ self.down.T) @ self.up.T
+        return self.wrapped(hidden) + correction.to(hidden.dtype) * self.scaling
+
+
+class ConfinedCapacity(nn.Module):
+    r"""
+    A frozen module plus a linear correction that reads only fixed input directions.
+
+    $$f(x) + U V^\top x$$
+
+    As built, $V$ is fixed: its columns are the directions of the module's input that deployment barely uses
+    ([`~ConfinedCapacity.directions_from_moments`]), so the correction answers almost nothing there however $U$ is
+    trained. A session expert replaces it with a trained `Parameter`, so the correction reads the whole
+    input. $U$ starts at zero, so the wrapped module answers exactly as it did before the first step.
+
+    Args:
+        wrapped (`nn.Module`):
+            The pretrained module, kept frozen: an FFN, or the value projection of an attention block.
+        basis (`torch.FloatTensor` of shape `(hidden_size, rank)`):
+            The directions the correction reads.
+        deploy_moment (`torch.FloatTensor` of shape `(rank, rank)`, *optional*):
+            Second moment of deployment inputs seen through `basis`.
+        empty_moment (`torch.FloatTensor` of shape `(rank, rank)`, *optional*):
+            Second moment of empty space inputs seen through `basis`.
+        out_features (`int`, *optional*):
+            Width of the wrapped module's output, `hidden_size` when omitted.
+    """
+
+    def __init__(
+        self, wrapped: nn.Module, basis: torch.Tensor, deploy_moment=None, empty_moment=None, out_features=None
+    ):
+        super().__init__()
+        self.wrapped = wrapped
+        self.register_buffer("basis", basis.float().contiguous())
+        self.up = nn.Parameter(
+            torch.zeros(out_features or basis.shape[0], basis.shape[1], dtype=torch.float32)
+        )
+        # Second moments of the FFN input seen through `basis`, `(rank, rank)`: the deployment inputs the
+        # correction must stay quiet on, and the empty space inputs it is meant to answer.
+        self.register_buffer("deploy_moment", None if deploy_moment is None else deploy_moment.float())
+        self.register_buffer("empty_moment", None if empty_moment is None else empty_moment.float())
+
+    @staticmethod
+    def directions_from_moments(moments: dict, rank: int) -> torch.Tensor:
+        r"""
+        Picks the input directions a confined correction reads, from the second moments of one layer.
+
+        Args:
+            moments (`dict`):
+                Normalized second moments of one layer and module, keyed by frame group, as
+                [`~polyplex_research.utils.evaluate.CapacityMeter`] writes them.
+            rank (`int`):
+                How many directions to return.
+
+        Returns:
+            `torch.FloatTensor` of shape `(hidden_size, rank)`: Directions outside the subspace holding 99% of the
+            deploy energy, in order of the Korean silent-condition energy they carry.
+        """
+        deploy = 0.5 * (moments["deploy_en_speech"].double() + moments["deploy_silent_pad"].double())
+        values, vectors = torch.linalg.eigh(deploy)
+        values, vectors = values.flip(0).clamp(min=0), vectors.flip(1)
+        protected = int(((values.cumsum(0) / values.sum()) < 0.99).sum()) + 1
+        basis = vectors[:, :protected]
+        outside = torch.eye(basis.shape[0], dtype=basis.dtype, device=basis.device) - basis @ basis.T
+        _, residual = torch.linalg.eigh(outside @ moments["empty_ko"].double().to(basis.device) @ outside)
+        return residual.flip(1)[:, :rank].float()
+
+    def output_energy(self, moment: torch.Tensor) -> torch.Tensor:
+        r"""
+        Args:
+            moment (`torch.FloatTensor` of shape `(rank, rank)`):
+                Second moment of the inputs, read through `basis`.
+
+        Returns:
+            `torch.Tensor`: The mean squared norm of the correction over those inputs, $\operatorname{tr}(U M U^\top)$.
+        """
+        return torch.einsum("hr,rs,hs->", self.up, moment, self.up)
+
+    def forward(self, hidden, *args, **kwargs):
+        output = self.wrapped(hidden, *args, **kwargs)
+        correction = (hidden.to(self.up.dtype) @ self.basis.to(self.up.dtype)) @ self.up.T
+        return output + correction.to(output.dtype)
+
+
 class EfficientAdapterP1Model(
     nn.Module,
     ModelHubMixin,
@@ -853,6 +1015,58 @@ class EfficientAdapterP1Model(
             logits.float().reshape(-1, reserved), flat.reshape(-1), ignore_index=-100, reduction="sum"
         ) / (flat != -100).sum().clamp(min=1)
 
+    def _confined_bases(self, path: str, module: str) -> list:
+        r"""
+        Reads one basis file and, when `confined_moments` is set, the moments each basis is scored on.
+
+        Args:
+            path (`str`):
+                Safetensors file keyed `layer_<index>`.
+            module (`str`):
+                `"ffn"` or `"attention"`, which moments of [`~polyplex_research.utils.evaluate.CapacityMeter`] the basis reads.
+
+        Returns:
+            `list`: `(index, basis, deploy_moment, empty_moment)` per layer, the moments `None` without
+            `confined_moments`.
+        """
+        entries = []
+        for key, basis in load_file(path).items():
+            index = int(key.removeprefix("layer_"))
+            deploy_moment = empty_moment = None
+            if self.config.confined_moments:
+                moments = torch.load(
+                    os.path.join(self.config.confined_moments, f"moments_{index:02d}_{module}.pt"),
+                    map_location="cpu",
+                )
+                deploy = 0.5 * (moments["deploy_en_speech"].float() + moments["deploy_silent_pad"].float())
+                deploy_moment = basis.T.float() @ deploy @ basis.float()
+                empty_moment = basis.T.float() @ moments["empty_ko"].float() @ basis.float()
+            entries.append((index, basis, deploy_moment, empty_moment))
+        return entries
+
+    def confined_leak(self) -> torch.Tensor:
+        r"""
+        Share of the confined corrections' output that lands on deployment inputs.
+
+        $$\frac{\sum_\ell \operatorname{tr}(U_\ell M^{\text{deploy}}_\ell U_\ell^\top)}{\operatorname{sg}\big(\sum_\ell \operatorname{tr}(U_\ell M^{\text{empty}}_\ell U_\ell^\top)\big)}$$
+
+        The moments are the ones [`~polyplex_research.utils.evaluate.CapacityMeter`] wrote, so the term costs no forward. The
+        denominator carries no gradient: the term asks the corrections to fall silent where deployment
+        reads, not to shrink where the empty space reads.
+
+        Returns:
+            `torch.Tensor`: The ratio, zero when no correction carries moments.
+
+        Raises:
+            ValueError: If the corrections were built without `confined_moments`.
+        """
+        modules = list(self.confined.values())
+        if not modules or modules[0].deploy_moment is None:
+            raise ValueError("`confined_leak` reads the moments of `confined_moments`, which were not given.")
+        deploy = sum(module.output_energy(module.deploy_moment) for module in modules)
+        empty = sum(module.output_energy(module.empty_moment) for module in modules)
+        return deploy / empty.detach().clamp(min=1e-8)
+
     def trainable_state(self) -> dict:
         r"""
         Returns:
@@ -909,6 +1123,61 @@ class EfficientAdapterP1Model(
             self.config.tie_new_input_rows and self.config.tied_backbone_grad
         )
 
+    def _build_row_support(self, mixture: int) -> torch.Tensor:
+        r"""
+        Picks, for every appended row, the pretrained rows it is allowed to be built from.
+
+        The choice is made once, off the initialisation the vocabulary expansion produced, so a new row
+        keeps the pretrained rows it already resembles.
+
+        Args:
+            mixture (`int`):
+                How many pretrained rows an appended row mixes.
+
+        Returns:
+            `torch.LongTensor` of shape `(appended_rows, mixture)`: Indices into the pretrained rows.
+        """
+        weight = self.model.get_output_embeddings().weight.data
+        base = nn.functional.normalize(weight[: self.config.base_vocab_size].float(), dim=-1)
+        appended = nn.functional.normalize(weight[self.config.base_vocab_size :].float(), dim=-1)
+        return torch.cat(
+            [
+                (appended[start : start + 512] @ base.T).topk(mixture, dim=-1).indices
+                for start in range(0, appended.shape[0], 512)
+            ]
+        )
+
+    @torch.no_grad()
+    def _fit_mixture(self, weight: torch.Tensor) -> torch.Tensor:
+        r"""
+        Fits every appended row of a table onto the span of the pretrained rows it mixes.
+
+        This is where the coefficients start, so the run begins at the row the vocabulary expansion
+        produced rather than at noise: the fit is the closest point of the allowed span to that row.
+
+        Args:
+            weight (`torch.Tensor` of shape `(rows, hidden_size)`):
+                The table whose appended rows are fitted.
+
+        Returns:
+            `torch.FloatTensor` of shape `(appended_rows, base_row_mixture)`: The coefficients.
+        """
+        base_vocab = self.config.base_vocab_size
+        pretrained = weight[:base_vocab].float()
+        eye = torch.eye(self.config.base_row_mixture, device=weight.device)
+        fitted = torch.empty(
+            self._row_support.shape, dtype=torch.float32, device=weight.device
+        )
+        for start in range(0, self._row_support.shape[0], self._mixture_chunk):
+            stop = start + self._mixture_chunk
+            support = pretrained[self._row_support[start:stop]]  # (chunk, mixture, hidden)
+            rows = weight[base_vocab + start : base_vocab + stop].float().unsqueeze(-1)
+            # Normal equations of the least squares fit of each row onto its own support.
+            fitted[start:stop] = torch.linalg.solve(
+                support @ support.transpose(1, 2) + 1e-3 * eye, support @ rows
+            ).squeeze(-1)
+        return fitted
+
     def appended_rows(self, position: int) -> torch.Tensor:
         r"""
         Builds the appended rows of one table out of its coefficients.
@@ -938,6 +1207,23 @@ class EfficientAdapterP1Model(
         module.weight.data[start:stop] = rows.detach().to(module.weight.dtype)
         return rows
 
+    def _mixture_part(self, weight: torch.Tensor) -> torch.Tensor:
+        r"""
+        Args:
+            weight (`torch.Tensor` of shape `(rows, hidden_size)`):
+                A table whose appended rows the mixture is fitted on.
+
+        Returns:
+            `torch.Tensor`: The table with the partition direction taken off the head's appended rows,
+            which is the part the mixture coefficients hold. Any other table comes back as it is.
+        """
+        head = self.model.get_output_embeddings().weight
+        if self.partition_direction is None or weight.data_ptr() != head.data_ptr():
+            return weight
+        weight = weight.clone()
+        weight[self.config.base_vocab_size : self.config.vocab_size] -= self.partition_direction.to(weight.dtype)
+        return weight
+
     def appended_weight(self) -> torch.Tensor:
         r"""
         Returns:
@@ -961,6 +1247,28 @@ class EfficientAdapterP1Model(
             return
         for position in range(len(self._tables)):
             self.appended_rows(position)
+
+    @torch.no_grad()
+    def refit_mixture(self):
+        r"""
+        Re-reads the coefficients off rows that were written into the tables from outside.
+
+        Loading a finished run copies row values in, and under the parameterisation those values are not
+        what the model reads: the coefficients are. Fitting them again is what makes a continued run
+        start from the rows the checkpoint holds instead of overwriting them at the first forward.
+        """
+        if self.row_mixture is None:
+            return
+        if self.config.share_row_mixture:
+            # The head is the table the shared coefficients were fitted on, and the others follow it.
+            head = self.model.get_output_embeddings().weight.data
+            self.row_mixture[0].data.copy_(self._fit_mixture(self._mixture_part(head)))
+        else:
+            for position, (_, module) in enumerate(self._tables):
+                self.row_mixture[position].data.copy_(
+                    self._fit_mixture(self._mixture_part(module.weight.data))
+                )
+        self.materialize_rows()
 
     def appended_view(self, hidden):
         r"""
@@ -1370,6 +1678,7 @@ class EfficientAdapterP1Model(
 __all__ = [
     "TEXT_ADAPTER_WEIGHTS_NAME",
     "EfficientAdapterP1Model",
+    "MixtureRows",
     "protect_leading_rows",
     "text_tables",
 ]
