@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import signal
 
 import torch
@@ -91,6 +92,28 @@ class Trainer(HuggingFaceTrainer):
     adapter_class = None
     dataset_class = None
     label_names = []
+
+    def _save(self, output_dir: str | None = None, state_dict=None):
+        r"""
+        Writes the slice the phase trains instead of the whole model.
+
+        The base implementation serializes every weight, which for a phase is the frozen backbone
+        written again at each checkpoint, and which fails outright once that backbone is loaded under
+        weight-only quantization, since the packed tensors hold no storage safetensors can point at.
+        The adapter already knows which slice moved and writes only that.
+
+        Args:
+            output_dir (`str`, *optional*):
+                Directory the checkpoint is written to, defaulting to the run's output directory.
+            state_dict (`dict`, *optional*):
+                Ignored. The adapter reads its own slice rather than a full state dict.
+        """
+        output_dir = output_dir if output_dir is not None else self.args.output_dir
+        os.makedirs(output_dir, exist_ok=True)
+        self.model.save_pretrained(output_dir)
+        if self.processing_class is not None:
+            self.processing_class.save_pretrained(output_dir)
+        torch.save(self.args, os.path.join(output_dir, "training_args.bin"))
 
     @staticmethod
     def token_group_metrics(base_vocab_size: int):
@@ -237,7 +260,12 @@ class Trainer(HuggingFaceTrainer):
         if strategy != "group_by_length" or not hasattr(dataset, "example_lengths"):
             return super()._get_train_sampler(train_dataset)
 
-        lengths = dataset.example_lengths(self.processing_class)
+        # A text dataset measures an example by tokenizing it, a duplex one already knows its frame
+        # count, so the tokenizer is offered and not imposed.
+        try:
+            lengths = dataset.example_lengths(self.processing_class)
+        except TypeError:
+            lengths = dataset.example_lengths()
         logger.info(
             "Length grouped batches over %d examples, %d to %d long.",
             len(lengths),
@@ -265,9 +293,11 @@ class Trainer(HuggingFaceTrainer):
         strategy = getattr(self.args, "train_sampling_strategy", None)
         if strategy != "group_by_length" or not hasattr(dataset, "example_lengths"):
             return super()._get_eval_sampler(eval_dataset)
-        return LengthGroupedSampler(
-            self.args.eval_batch_size, lengths=dataset.example_lengths(self.processing_class)
-        )
+        try:
+            lengths = dataset.example_lengths(self.processing_class)
+        except TypeError:
+            lengths = dataset.example_lengths()
+        return LengthGroupedSampler(self.args.eval_batch_size, lengths=lengths)
 
     def _check_model(self, model):
         r"""
