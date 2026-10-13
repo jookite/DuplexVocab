@@ -7,6 +7,7 @@ from .base import (
     SingleTurnTTSDataset,
     SingleTurnTTSExample,
 )
+from .ksponspeech import KSPONSPEECH_URL, KsponSpeechDataset, normalize_transcription
 from .instruction import KOREAN_INSTRUCTION_URLS, iter_instruction_texts
 from .translation import COLLOQUIAL_KOEN_URL, ColloquialKoEnDataset, TranslationExample
 from .phase_data import Phase1Dataset, Phase1Example, Phase2Dataset
