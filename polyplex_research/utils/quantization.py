@@ -372,6 +372,184 @@ class HadamardNVFP4Linear(nn.Linear):
         return out.reshape(*shape[:-1], out.shape[-1])
 
 
+class FrozenNVFP4Linear(nn.Module):
+    r"""
+    A frozen projection held in NVFP4 alone (SPEC S7.1). Its weight is rotated and quantized once when the
+    projection is built and the full precision weight is dropped, so the module carries the quantized weight, the
+    rotation and the bias only. It computes what [`HadamardNVFP4Linear`] computes for a frozen weight, and passes a
+    gradient to its input.
+
+    Args:
+        quantized_weight (`NVFP4Tensor`):
+            The rotated weight, quantized.
+        bias (`nn.Parameter`, *optional*):
+            The bias, kept as it is.
+        hadamard_group_size (`int`, *optional*, defaults to 16):
+            Order of the rotation the weight was quantized under.
+        backward_dtype (`str`, *optional*, defaults to `"bf16"`):
+            Precision of the input gradient's matmul, one of [`BACKWARD_DTYPES`] (SPEC S7.1a).
+
+    Raises:
+        ValueError: If `backward_dtype` is not one of [`BACKWARD_DTYPES`].
+    """
+
+    def __init__(
+        self, quantized_weight, bias=None, hadamard_group_size: int = NVFP4_BLOCK_SIZE, backward_dtype: str = "bf16"
+    ):
+        super().__init__()
+        _check_backward_dtype(backward_dtype)
+        self.backward_dtype = backward_dtype
+        self.out_features, self.in_features = quantized_weight.shape
+        # Saved as its codes and scales (`_save_to_state_dict`), not as the tensor subclass itself.
+        self.register_buffer("quantized_weight", quantized_weight, persistent=False)
+        self.bias = bias
+        self.register_buffer(
+            "forward_transform",
+            _hadamard_matrix(hadamard_group_size, quantized_weight.dtype, quantized_weight.device),
+            persistent=False,
+        )
+        self.backward_weight = None
+
+    def cache_backward_weight(self, cache: bool = True) -> None:
+        r"""
+        Keeps the weight the MXFP8 input gradient reads, quantized once, so a backward does not quantize it again
+        (SPEC S7.1a). It costs one byte per weight on the device.
+
+        Args:
+            cache (`bool`, *optional*, defaults to `True`):
+                Whether to keep it. `False` drops it.
+        """
+        self.backward_weight = None
+        if cache and self.backward_dtype == "mxfp8":
+            weight = dequantize_nvfp4(self.quantized_weight, self.quantized_weight.orig_dtype)
+            self.backward_weight = _to_mxfp8(weight.t())
+
+    @classmethod
+    def empty(
+        cls,
+        in_features: int,
+        out_features: int,
+        bias: bool = True,
+        hadamard_group_size: int = NVFP4_BLOCK_SIZE,
+        backward_dtype: str = "bf16",
+        device=None,
+        dtype: torch.dtype = torch.bfloat16,
+    ) -> "FrozenNVFP4Linear":
+        r"""
+        A frozen projection with no weight yet, for a saved one to be loaded into ([`~torch.nn.Module.load_state_dict`]).
+
+        Args:
+            in_features (`int`):
+                Size of the reduction axis.
+            out_features (`int`):
+                Size of the output axis.
+            bias (`bool`, *optional*, defaults to `True`):
+                Whether the projection carries a bias.
+            hadamard_group_size (`int`, *optional*, defaults to 16):
+                Order of the rotation the weight was quantized under.
+            backward_dtype (`str`, *optional*, defaults to `"bf16"`):
+                Precision of the input gradient's matmul.
+            device (`torch.device`, *optional*):
+                Device of the bias and the rotation.
+            dtype (`torch.dtype`, *optional*, defaults to `torch.bfloat16`):
+                Precision the weight was quantized from and the bias is held in.
+
+        Returns:
+            `FrozenNVFP4Linear`: The projection, whose `quantized_weight` is `None` until loaded.
+        """
+        module = cls.__new__(cls)
+        nn.Module.__init__(module)
+        _check_backward_dtype(backward_dtype)
+        module.backward_dtype = backward_dtype
+        module.in_features, module.out_features = in_features, out_features
+        module.weight_dtype = dtype
+        module.register_buffer("quantized_weight", None, persistent=False)
+        module.bias = (
+            nn.Parameter(torch.empty(out_features, device=device, dtype=dtype), requires_grad=False) if bias else None
+        )
+        module.register_buffer(
+            "forward_transform", _hadamard_matrix(hadamard_group_size, dtype, device or torch.device("cpu")), persistent=False
+        )
+        module.backward_weight = None
+        return module
+
+    def _save_to_state_dict(self, destination, prefix, keep_vars):
+        super()._save_to_state_dict(destination, prefix, keep_vars)
+        if self.quantized_weight is None:
+            return
+        weight = self.quantized_weight
+        rows, columns = weight.shape
+        block_scales = weight.scale
+        if weight.is_swizzled_scales:
+            block_scales = from_blocked(block_scales, rows, columns // NVFP4_BLOCK_SIZE)
+        destination[prefix + "codes"] = weight.qdata.contiguous().view(torch.uint8)
+        destination[prefix + "block_scales"] = block_scales.reshape(rows, columns // NVFP4_BLOCK_SIZE).contiguous()
+        destination[prefix + "global_scale"] = weight.per_tensor_scale.reshape(()).float()
+
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
+        keys = [prefix + name for name in ("codes", "block_scales", "global_scale")]
+        if all(key in state_dict for key in keys):
+            codes, block_scales, global_scale = (state_dict.pop(key) for key in keys)
+            rows, columns = self.out_features, self.in_features
+            scale_rows, scale_columns = hp_data_dims_to_swizzled_scale_dims_nvfp4(rows, columns)
+            swizzled = to_blocked(block_scales.view(rows, columns // NVFP4_BLOCK_SIZE)).flatten()
+            dtype = getattr(self, "weight_dtype", None) or self.forward_transform.dtype
+            self.quantized_weight = NVFP4Tensor(
+                codes.view(torch.uint8),
+                swizzled.view(scale_rows, scale_columns),
+                NVFP4_BLOCK_SIZE,
+                dtype,
+                global_scale.float(),
+                None,
+                True,
+            )
+            if self.forward_transform.device != codes.device:
+                self.forward_transform = self.forward_transform.to(codes.device)
+        elif strict:
+            missing_keys.extend(key for key in keys if key not in state_dict)
+        super()._load_from_state_dict(state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs)
+
+    @classmethod
+    def from_linear(
+        cls, linear: nn.Linear, hadamard_group_size: int = NVFP4_BLOCK_SIZE, backward_dtype: str = "bf16"
+    ) -> "FrozenNVFP4Linear":
+        r"""
+        Args:
+            linear (`nn.Linear`):
+                The projection to freeze. Its weight is quantized and not kept.
+            hadamard_group_size (`int`, *optional*, defaults to 16):
+                Order of the rotation.
+            backward_dtype (`str`, *optional*, defaults to `"bf16"`):
+                Precision of the input gradient's matmul.
+
+        Returns:
+            `FrozenNVFP4Linear`: The frozen projection.
+        """
+        weight = linear.weight.detach()
+        transform = _hadamard_matrix(hadamard_group_size, weight.dtype, weight.device)
+        bias = linear.bias
+        if bias is not None:
+            bias.requires_grad_(False)
+        return cls(_to_nvfp4(_rotate(weight, transform)), bias, hadamard_group_size, backward_dtype)
+
+    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
+        r"""
+        Args:
+            hidden (`torch.Tensor`):
+                Activations, of any rank whose last dimension is `in_features`.
+
+        Returns:
+            `torch.Tensor`: The result, in `hidden`'s shape and dtype.
+        """
+        shape = hidden.shape
+        flat = hidden.reshape(-1, shape[-1])
+        transform = self.forward_transform.to(flat.dtype)
+        out = _HadamardNVFP4Matmul.apply(
+            flat, None, self.bias, transform, self.quantized_weight, self.backward_dtype, None, self.backward_weight
+        )
+        return out.reshape(*shape[:-1], out.shape[-1])
+
+
 def quantize_linears_nvfp4(
     module: nn.Module,
     hadamard_group_size: int = NVFP4_BLOCK_SIZE,
