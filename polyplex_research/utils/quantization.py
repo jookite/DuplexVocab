@@ -37,8 +37,10 @@ logger = logging.getLogger(__name__)
 NVFP4_BLOCK_SIZE = 16
 """Elements per NVFP4 block scale. The packed layout admits no other value."""
 
+MXFP8_BLOCK_SIZE = 32
 """Elements per MXFP8 block scale."""
 
+BACKWARD_DTYPES = ("bf16", "mxfp8", "nvfp4")
 """Precisions the two backward matmuls of an NVFP4 projection can run in (SPEC S7.1a)."""
 
 
@@ -155,6 +157,144 @@ def dequantize_nvfp4(quantized, dtype: torch.dtype) -> torch.Tensor:
     restored = (values.view(rows, columns // quantized.block_size, quantized.block_size) * scales).view(rows, columns)
     restored = restored.to(dtype)
     return restored.transpose(-2, -1) if transposed else restored
+
+
+def _to_mxfp8(tensor: torch.Tensor) -> MXTensor:
+    """Quantizes a `(m, k)` tensor to MXFP8 along its last axis, padded with zeros to whole blocks.
+
+    Args:
+        tensor (`torch.Tensor`):
+            The tensor.
+
+    Returns:
+        `MXTensor`: The quantized tensor.
+    """
+    pad = -tensor.shape[-1] % MXFP8_BLOCK_SIZE
+    if pad:
+        # Zeros along the reduction axis add nothing to the product.
+        tensor = torch.nn.functional.pad(tensor, (0, pad))
+    return MXTensor.to_mx(
+        tensor.contiguous(),
+        torch.float8_e4m3fn,
+        MXFP8_BLOCK_SIZE,
+        # Rounding the shared exponent up keeps the block maximum representable; rounding it
+        # down, the OCP default, saturates it and is reported to diverge in training.
+        scaling_mode=ScaleCalculationMode.RCEIL,
+        kernel_preference=KernelPreference.AUTO,
+    )
+
+
+def _mxfp8_mm(left: torch.Tensor, right: torch.Tensor, quantized_right: MXTensor | None = None) -> torch.Tensor:
+    """Computes `left @ right.T` with both operands quantized to MXFP8 along the reduction axis.
+
+    Args:
+        left (`torch.Tensor`):
+            A `(m, k)` operand.
+        right (`torch.Tensor`):
+            A `(n, k)` operand. Not read when `quantized_right` is given.
+        quantized_right (`MXTensor`, *optional*):
+            `right` already quantized by [`_to_mxfp8`].
+
+    Returns:
+        `torch.Tensor`: The `(m, n)` product, in `left`'s dtype.
+    """
+    if quantized_right is None:
+        quantized_right = _to_mxfp8(right)
+    return torch.mm(_to_mxfp8(left), quantized_right.t()).to(left.dtype)
+
+
+def _to_nvfp4_stochastic(tensor: torch.Tensor) -> NVFP4Tensor:
+    """Quantizes one tensor to NVFP4 with stochastic rounding of its elements.
+
+    The global and block scales are computed as torchao's round to nearest quantizer computes them; each
+    scaled element then rounds up to the next E2M1 value with a probability equal to its distance from the
+    one below, so the quantized tensor is unbiased.
+
+    Args:
+        tensor (`torch.Tensor`):
+            A two dimensional tensor whose last dimension is a multiple of [`NVFP4_BLOCK_SIZE`].
+
+    Returns:
+        `NVFP4Tensor`: The quantized tensor, with block scales in the layout the FP4 matmul reads.
+    """
+    rows, columns = tensor.shape
+    per_tensor_scale = per_tensor_amax_to_scale(tensor.abs().max())
+    data = tensor.float().reshape(rows, -1, NVFP4_BLOCK_SIZE)
+    block_scale = data.abs().amax(dim=-1) / F4_E2M1_MAX
+    block_scale_fp8 = torch.clamp(
+        block_scale / per_tensor_scale, min=torch.finfo(torch.float8_e4m3fn).tiny, max=F8E4M3_MAX
+    ).to(torch.float8_e4m3fn)
+    scaled = data * ((1.0 / per_tensor_scale) / block_scale_fp8.float()).unsqueeze(-1)
+    scaled = torch.clamp(scaled, -F4_E2M1_MAX, F4_E2M1_MAX).reshape(rows, columns)
+
+    # The E2M1 magnitudes are spaced 0.5 apart below 2, 1 apart up to 4 and 2 apart up to 6.
+    magnitude = scaled.abs()
+    step = torch.where(magnitude >= 4.0, 2.0, torch.where(magnitude >= 2.0, 1.0, 0.5))
+    lower = torch.floor(magnitude / step) * step
+    upper = torch.clamp(lower + step, max=F4_E2M1_MAX)
+    round_up = torch.rand_like(magnitude) * step < magnitude - lower
+    snapped = torch.where(round_up, upper, lower).copysign(scaled)
+
+    scale_rows, scale_columns = hp_data_dims_to_swizzled_scale_dims_nvfp4(rows, columns)
+    swizzled_scale = to_blocked(block_scale_fp8.view(rows, columns // NVFP4_BLOCK_SIZE)).flatten()
+    return NVFP4Tensor(
+        pack_uint4(f32_to_f4_unpacked(snapped)),
+        swizzled_scale.view(scale_rows, scale_columns),
+        NVFP4_BLOCK_SIZE,
+        tensor.dtype,
+        per_tensor_scale,
+        None,
+        True,
+    )
+
+
+def _random_hadamard(size: int, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+    """Builds a Hadamard matrix with its rows multiplied by a fixed pseudo random sign vector.
+
+    Args:
+        size (`int`):
+            Order of the matrix. Must be a power of two.
+        dtype (`torch.dtype`):
+            Precision the matrix is returned in.
+        device (`torch.device`):
+            Device the matrix is built on.
+
+    Returns:
+        `torch.Tensor`: An orthogonal `(size, size)` matrix. The signs come from a fixed seed, so every layer
+        and every call uses the same one.
+    """
+    signs = torch.randint(0, 2, (size,), generator=torch.Generator().manual_seed(0)) * 2 - 1
+    matrix = signs.to(torch.float32)[:, None] * _hadamard_matrix(size, torch.float32, torch.device("cpu"))
+    return matrix.to(device=device, dtype=dtype)
+
+
+def _nvfp4_mm(left: torch.Tensor, right: torch.Tensor, stochastic_left: bool) -> torch.Tensor:
+    """Computes `left @ right.T` with both operands quantized to NVFP4 along the reduction axis.
+
+    Args:
+        left (`torch.Tensor`):
+            A `(m, k)` operand, the gradient in either backward matmul.
+        right (`torch.Tensor`):
+            A `(n, k)` operand.
+        stochastic_left (`bool`):
+            Whether `left` is rounded stochastically. `right` is always rounded to nearest.
+
+    Returns:
+        `torch.Tensor`: The `(m, n)` product, in `left`'s dtype.
+    """
+    pad = -left.shape[-1] % (2 * NVFP4_BLOCK_SIZE)
+    if pad:
+        # Zeros along the reduction axis add nothing to the product.
+        left = torch.nn.functional.pad(left, (0, pad))
+        right = torch.nn.functional.pad(right, (0, pad))
+    left = left.contiguous()
+    quantized_left = _to_nvfp4_stochastic(left) if stochastic_left else _to_nvfp4(left)
+    return _addmm_nvfp4_dispatch(quantized_left, _to_nvfp4(right.contiguous()).t(), None, None).to(left.dtype)
+
+
+def _check_backward_dtype(backward_dtype: str) -> None:
+    if backward_dtype not in BACKWARD_DTYPES:
+        raise ValueError(f"backward_dtype must be one of {BACKWARD_DTYPES}, got {backward_dtype!r}")
 
 
 class _HadamardNVFP4Matmul(torch.autograd.Function):
@@ -603,6 +743,91 @@ def quantize_linears_nvfp4(
     walk(module, "")
     logger.info("%d linear projections now run in NVFP4", len(replaced))
     return replaced
+
+
+def set_nvfp4_backward(model: nn.Module, backward_dtype: str, cache_weights: bool = False) -> int:
+    r"""
+    Switches the backward precision of every NVFP4 projection in a model (SPEC S7.1a). The forward is untouched.
+
+    Args:
+        model (`nn.Module`):
+            The model whose projections are switched.
+        backward_dtype (`str`):
+            One of [`BACKWARD_DTYPES`].
+        cache_weights (`bool`, *optional*, defaults to `False`):
+            Whether each frozen projection keeps the weight its MXFP8 input gradient reads
+            ([`FrozenNVFP4Linear.cache_backward_weight`]), about one byte per weight on the device.
+
+    Returns:
+        `int`: How many projections were switched.
+
+    Raises:
+        ValueError: If `backward_dtype` is not one of [`BACKWARD_DTYPES`].
+    """
+    _check_backward_dtype(backward_dtype)
+    layers = [module for module in model.modules() if isinstance(module, (HadamardNVFP4Linear, FrozenNVFP4Linear))]
+    for layer in layers:
+        layer.backward_dtype = backward_dtype
+        if isinstance(layer, FrozenNVFP4Linear):
+            layer.cache_backward_weight(cache_weights)
+    return len(layers)
+
+
+def compiled_gradient_error(
+    rows: int = 4096, size: int = 4096, device: str = "cuda", dtype: torch.dtype = torch.bfloat16, compiler=None
+) -> dict:
+    r"""
+    Measures how far the backward of the NVFP4 projections under `torch.compile` is from the eager one (AGENTS H31):
+    the relative difference of the input and weight gradients of a trained [`HadamardNVFP4Linear`], and of the input
+    gradient of a [`FrozenNVFP4Linear`], on the same random input and output gradient.
+
+    Args:
+        rows (`int`, *optional*, defaults to 4096):
+            Tokens of the input.
+        size (`int`, *optional*, defaults to 4096):
+            Input and output width of the projection.
+        device (`str`, *optional*, defaults to `"cuda"`):
+            Where it runs.
+        dtype (`torch.dtype`, *optional*, defaults to `torch.bfloat16`):
+            Dtype of the projection and the input.
+        compiler (`Callable`, *optional*):
+            Turns a module into its compiled version, `torch.compile` when omitted.
+
+    Returns:
+        `dict`: `trained_grad_input`, `trained_grad_weight` and `frozen_grad_input`, each `|compiled - eager| /
+        |eager|` in the Frobenius norm.
+    """
+    compiler = compiler or torch.compile
+    torch.manual_seed(0)
+    source = nn.Linear(size, size, bias=False, device=device, dtype=dtype)
+    hidden = torch.randn(rows, size, device=device, dtype=dtype)
+    grad = torch.randn(rows, size, device=device, dtype=dtype)
+
+    def gradients(layer, trained: bool):
+        given = hidden.clone().requires_grad_(True)
+        layer(given).backward(grad)
+        weight = layer.weight.grad.float() if trained else None
+        if trained:
+            layer.weight.grad = None
+        return given.grad.float(), weight
+
+    def relative(compiled, eager):
+        return ((compiled - eager).norm() / eager.norm().clamp_min(1e-30)).item()
+
+    trained = HadamardNVFP4Linear.from_linear(source)
+    eager_input, eager_weight = gradients(trained, True)
+    compiled_input, compiled_weight = gradients(compiler(trained), True)
+    frozen_source = nn.Linear(size, size, bias=False, device=device, dtype=dtype)
+    frozen_source.weight.data.copy_(source.weight.data)
+    frozen_source.weight.requires_grad_(False)
+    frozen = FrozenNVFP4Linear.from_linear(frozen_source)
+    frozen_eager, _ = gradients(frozen, False)
+    frozen_compiled, _ = gradients(compiler(frozen), False)
+    return {
+        "trained_grad_input": relative(compiled_input, eager_input),
+        "trained_grad_weight": relative(compiled_weight, eager_weight),
+        "frozen_grad_input": relative(frozen_compiled, frozen_eager),
+    }
 
 
 __all__ = ["HadamardNVFP4Linear", "NVFP4_BLOCK_SIZE", "quantize_linears_nvfp4"]
