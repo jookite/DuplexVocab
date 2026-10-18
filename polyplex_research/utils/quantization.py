@@ -831,3 +831,155 @@ def compiled_gradient_error(
 
 
 __all__ = ["HadamardNVFP4Linear", "NVFP4_BLOCK_SIZE", "quantize_linears_nvfp4"]
+
+
+def nvfp4_round_trip(tensor: torch.Tensor, amax: float | None = None) -> torch.Tensor:
+    r"""
+    The values a tensor takes after NVFP4 quantization, computed without the FP4 kernels so it runs on any device.
+
+    Args:
+        tensor (`torch.Tensor`):
+            A two dimensional tensor whose last dimension is a multiple of [`NVFP4_BLOCK_SIZE`].
+        amax (`float`, *optional*):
+            The absolute maximum the global scale is set from. Read off `tensor` when omitted.
+
+    Returns:
+        `torch.Tensor`: The dequantized tensor, in float32.
+    """
+    tensor = tensor.float()
+    amax = tensor.abs().max() if amax is None else torch.tensor(amax, dtype=torch.float32, device=tensor.device)
+    quantized = NVFP4Tensor.to_nvfp4(
+        tensor,
+        block_size=NVFP4_BLOCK_SIZE,
+        per_tensor_scale=per_tensor_amax_to_scale(amax),
+        is_swizzled_scales=False,
+        use_triton_kernel=False,
+    )
+    return quantized.dequantize(torch.float32)
+
+
+class EmulatedNVFP4Linear(nn.Linear):
+    r"""
+    Computes what [`HadamardNVFP4Linear`] computes, from dequantized operands in float32, so its error can be
+    measured on any device.
+
+    Args:
+        in_features (`int`):
+            Size of the reduction axis. Must be a multiple of `hadamard_group_size`.
+        out_features (`int`):
+            Size of the output.
+        bias (`bool`, *optional*, defaults to `True`):
+            Whether the projection carries a bias.
+        hadamard_group_size (`int`, *optional*, defaults to 16):
+            Order of the rotation applied to each group of the reduction axis.
+        quantize_activations (`bool`, *optional*, defaults to `True`):
+            Whether the activations are quantized too, each token under its own scale. Without it only the weight is.
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        bias: bool = True,
+        hadamard_group_size: int = NVFP4_BLOCK_SIZE,
+        quantize_activations: bool = True,
+        **kwargs,
+    ):
+        super().__init__(in_features, out_features, bias=bias, **kwargs)
+        self.quantize_activations = quantize_activations
+        self.register_buffer(
+            "forward_transform", _hadamard_matrix(hadamard_group_size, torch.float32, self.weight.device), persistent=False
+        )
+        self._rounded_weight = None
+
+    @classmethod
+    def from_linear(
+        cls, linear: nn.Linear, hadamard_group_size: int = NVFP4_BLOCK_SIZE, quantize_activations: bool = True
+    ) -> "EmulatedNVFP4Linear":
+        r"""
+        Args:
+            linear (`nn.Linear`):
+                The projection to emulate. Its weight and bias are shared, not copied.
+            hadamard_group_size (`int`, *optional*, defaults to 16):
+                Order of the rotation.
+            quantize_activations (`bool`, *optional*, defaults to `True`):
+                Whether the activations are quantized too.
+
+        Returns:
+            `EmulatedNVFP4Linear`: The emulated projection.
+        """
+        replacement = cls(
+            linear.in_features,
+            linear.out_features,
+            bias=linear.bias is not None,
+            hadamard_group_size=hadamard_group_size,
+            quantize_activations=quantize_activations,
+            device="meta",
+        )
+        replacement.weight = linear.weight
+        replacement.bias = linear.bias
+        replacement.forward_transform = _hadamard_matrix(hadamard_group_size, torch.float32, linear.weight.device)
+        return replacement
+
+    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
+        r"""
+        Args:
+            hidden (`torch.Tensor`):
+                Activations, of any rank whose last dimension is `in_features`.
+
+        Returns:
+            `torch.Tensor`: The result, in `hidden`'s shape and dtype.
+        """
+        shape = hidden.shape
+        rotated = _rotate(hidden.reshape(-1, shape[-1]).float(), self.forward_transform)
+        if self.quantize_activations:
+            row_scale = rotated.abs().amax(dim=-1, keepdim=True)
+            row_scale = torch.where(row_scale > 0, row_scale, torch.ones_like(row_scale))
+            rotated = nvfp4_round_trip(rotated / row_scale, amax=1.0) * row_scale
+        if self._rounded_weight is None:
+            # The weight is frozen while its error is measured, so it is rounded once.
+            self._rounded_weight = nvfp4_round_trip(_rotate(self.weight.detach().float(), self.forward_transform))
+        out = rotated @ self._rounded_weight.T
+        if self.bias is not None:
+            out = out + self.bias.float()
+        return out.to(hidden.dtype).reshape(*shape[:-1], out.shape[-1])
+
+
+def emulate_linears_nvfp4(
+    module: nn.Module,
+    hadamard_group_size: int = NVFP4_BLOCK_SIZE,
+    quantize_activations: bool = True,
+    skip=None,
+):
+    r"""
+    Replaces every `nn.Linear` under `module` with [`EmulatedNVFP4Linear`], in place.
+
+    Args:
+        module (`nn.Module`):
+            The subtree to convert.
+        hadamard_group_size (`int`, *optional*, defaults to 16):
+            Order of the rotation.
+        quantize_activations (`bool`, *optional*, defaults to `True`):
+            Whether the activations are quantized too.
+        skip (`Callable[[str], bool]`, *optional*):
+            Returns `True` for the qualified names of layers to leave in full precision.
+
+    Returns:
+        `Callable[[], None]`: Puts the original layers back.
+    """
+    swapped = []
+    for qualified, child in list(module.named_modules()):
+        if not isinstance(child, nn.Linear) or isinstance(child, EmulatedNVFP4Linear):
+            continue
+        if child.in_features % hadamard_group_size or (skip is not None and skip(qualified)):
+            continue
+        parent_name, _, name = qualified.rpartition(".")
+        parent = module.get_submodule(parent_name) if parent_name else module
+        setattr(parent, name, EmulatedNVFP4Linear.from_linear(child, hadamard_group_size, quantize_activations))
+        swapped.append((parent, name, child))
+
+    def restore():
+        for parent, name, child in swapped:
+            setattr(parent, name, child)
+
+    return restore
