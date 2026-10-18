@@ -67,6 +67,160 @@ class GracefulShutdownCallback(TrainerCallback):
         return control
 
 
+class ResearchTreeCallback(TrainerCallback):
+    r"""
+    Constructs a callback that writes a finished run's result into its ResearchTree experiment pull request.
+
+    The pull request of the `experiment/*` branch the run was started from is the lab note. At the end of
+    training, the metrics of the last evaluation go into its `metrics` field and the W&B run link into its
+    `wandb` field. Curves stay on W&B. Only the main process writes, and a run outside an experiment branch,
+    without a token or without the `researchtree` package writes nothing and does not fail.
+
+    Args:
+        log (`Callable`, *optional*):
+            Receives the final metrics as keyword arguments. Defaults to `researchtree.log`.
+        set_fields (`Callable`, *optional*):
+            Receives pull request fields as keyword arguments. Defaults to `researchtree.set`.
+        wandb_url (`Callable`, *optional*):
+            Returns the URL of the active W&B run, or `None`. Defaults to reading `wandb.run`.
+    """
+
+    def __init__(self, log=None, set_fields=None, wandb_url=None):
+        self.log = log
+        self.set_fields = set_fields
+        self.wandb_url = wandb_url or _active_wandb_url
+        self.metrics = {}
+
+    def on_evaluate(self, args, state, control, metrics=None, **kwargs):
+        r"""
+        Args:
+            args (`TrainingArguments`):
+                Configuration of the run.
+            state (`TrainerState`):
+                State of the loop.
+            control (`TrainerControl`):
+                Flags the loop reads after the callback returns.
+            metrics (`dict`, *optional*):
+                Metrics of the evaluation that just finished.
+        """
+        if state.is_world_process_zero and metrics:
+            self.metrics = {
+                key: float(value)
+                for key, value in metrics.items()
+                if key.startswith("eval_") and isinstance(value, (int, float))
+            }
+
+    def on_train_end(self, args, state, control, **kwargs):
+        r"""
+        Args:
+            args (`TrainingArguments`):
+                Configuration of the run.
+            state (`TrainerState`):
+                State of the loop.
+            control (`TrainerControl`):
+                Flags the loop reads after the callback returns.
+        """
+        if not state.is_world_process_zero:
+            return
+        log, set_fields = self.log, self.set_fields
+        if log is None or set_fields is None:
+            try:
+                import researchtree
+            except ImportError:
+                logger.warning("researchtree is not installed; the experiment pull request is not updated.")
+                return
+            log = log or researchtree.log
+            set_fields = set_fields or researchtree.set
+        if self.metrics:
+            log(**self.metrics)
+        url = self.wandb_url()
+        if url:
+            set_fields(wandb=url)
+
+
+class RunRecordCallback(TrainerCallback):
+    r"""
+    Constructs a callback that adds what the trainer does not know to the W&B run's configuration.
+
+    The trainer records its own arguments. The starting checkpoint, the data, the phase options and the
+    commit the run was started from are this project's, and are written once training begins, after the
+    W&B callback has opened the run. A run without W&B is left alone.
+
+    Args:
+        record (`dict`):
+            Values to add, keyed as they should appear in the configuration.
+        active_run (`Callable`, *optional*):
+            Returns the active W&B run, or `None`. Defaults to reading `wandb.run`.
+    """
+
+    def __init__(self, record: dict, active_run=None):
+        self.record = dict(record)
+        self.active_run = active_run or _active_wandb_run
+
+    def on_train_begin(self, args, state, control, **kwargs):
+        r"""
+        Args:
+            args (`TrainingArguments`):
+                Configuration of the run.
+            state (`TrainerState`):
+                State of the loop.
+            control (`TrainerControl`):
+                Flags the loop reads after the callback returns.
+        """
+        run = self.active_run()
+        if state.is_world_process_zero and run is not None:
+            run.config.update(self.record, allow_val_change=True)
+
+
+def git_record(path: str | None = None) -> dict:
+    r"""
+    Args:
+        path (`str`, *optional*):
+            A directory inside the checkout, the current directory by default.
+
+    Returns:
+        `dict`: `record/git_commit`, `record/git_branch` and `record/git_dirty` (uncommitted changes to tracked
+        files), or an empty dict outside a git checkout.
+    """
+    import subprocess
+
+    def git(*arguments):
+        return subprocess.run(["git", *arguments], cwd=path, capture_output=True, text=True, check=True).stdout.strip()
+
+    try:
+        return {
+            "record/git_commit": git("rev-parse", "HEAD"),
+            "record/git_branch": git("rev-parse", "--abbrev-ref", "HEAD"),
+            "record/git_dirty": bool(git("status", "--porcelain", "--untracked-files=no")),
+        }
+    except (OSError, subprocess.CalledProcessError):
+        return {}
+
+
+def _active_wandb_run():
+    r"""
+    Returns:
+        `wandb.sdk.wandb_run.Run` or `None`: The W&B run of this process, `None` when W&B is not in use.
+    """
+    try:
+        import wandb
+    except ImportError:
+        return None
+    return wandb.run
+
+
+def _active_wandb_url():
+    r"""
+    Returns:
+        `str` or `None`: The URL of the W&B run of this process, `None` when W&B is not in use.
+    """
+    try:
+        import wandb
+    except ImportError:
+        return None
+    return wandb.run.url if wandb.run is not None else None
+
+
 class Trainer(HuggingFaceTrainer):
     r"""
     Base of the phase trainers, holding what makes a phase a phase.
@@ -352,4 +506,4 @@ class Trainer(HuggingFaceTrainer):
                 model.enable_input_require_grads()
 
 
-__all__ = ["GracefulShutdownCallback", "Trainer"]
+__all__ = ["GracefulShutdownCallback", "ResearchTreeCallback", "RunRecordCallback", "Trainer", "git_record"]
