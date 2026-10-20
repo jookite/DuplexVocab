@@ -101,6 +101,34 @@ def read_speak_log(path: str) -> list:
     return records
 
 
+def character_error_rate(reference: str, hypothesis: str) -> float:
+    r"""
+    Edit distance between two texts over the reference length, counted on characters with spaces and
+    punctuation removed, since Korean spacing and the marks a recognizer adds are not what is being judged.
+
+    Args:
+        reference (`str`):
+            The text that should have been said.
+        hypothesis (`str`):
+            The text recognized.
+
+    Returns:
+        `float`: Substitutions, insertions and deletions divided by the reference length, `1.0` for an empty
+        reference with a non empty hypothesis.
+    """
+    reference = [character for character in reference if character.isalnum()]
+    hypothesis = [character for character in hypothesis if character.isalnum()]
+    if not reference:
+        return 0.0 if not hypothesis else 1.0
+    previous = list(range(len(hypothesis) + 1))
+    for row, expected in enumerate(reference, start=1):
+        current = [row]
+        for column, found in enumerate(hypothesis, start=1):
+            current.append(min(previous[column] + 1, current[column - 1] + 1, previous[column - 1] + (expected != found)))
+        previous = current
+    return previous[-1] / len(reference)
+
+
 class Evaluator:
     r"""
     Computes the three metric groups the evaluation reports.
@@ -137,6 +165,89 @@ class Evaluator:
     # -----------------------------------------------------------------
     # Transcription
     # -----------------------------------------------------------------
+
+    @staticmethod
+    def _edit_distance(reference: list, hypothesis: list) -> int:
+        r"""
+        Args:
+            reference (`list`):
+                Reference tokens.
+            hypothesis (`list`):
+                Hypothesis tokens.
+
+        Returns:
+            `int`: The Levenshtein distance between the two sequences.
+        """
+        previous = list(range(len(hypothesis) + 1))
+        for i, reference_token in enumerate(reference, start=1):
+            current = [i]
+            for j, hypothesis_token in enumerate(hypothesis, start=1):
+                current.append(
+                    min(
+                        previous[j] + 1,
+                        current[j - 1] + 1,
+                        previous[j - 1] + (reference_token != hypothesis_token),
+                    )
+                )
+            previous = current
+        return previous[-1]
+
+    @classmethod
+    def _error_rate(cls, references: list, hypotheses: list, tokenize) -> float:
+        r"""
+        Args:
+            references (`list` of `str`):
+                Ground truth strings.
+            hypotheses (`list` of `str`):
+                Predicted strings, aligned with `references`.
+            tokenize (`Callable`):
+                Splits one string into the units the rate counts.
+
+        Returns:
+            `float`: Total edits over total reference units, `0.0` when the references are empty.
+
+        Raises:
+            ValueError: If the two lists differ in length.
+        """
+        if len(references) != len(hypotheses):
+            raise ValueError(
+                f"Got {len(references)} references and {len(hypotheses)} hypotheses, they must be aligned."
+            )
+        edits = 0
+        units = 0
+        for reference, hypothesis in zip(references, hypotheses):
+            reference_tokens = tokenize(reference)
+            edits += cls._edit_distance(reference_tokens, tokenize(hypothesis))
+            units += len(reference_tokens)
+        return edits / units if units else 0.0
+
+    @classmethod
+    def character_error_rate(cls, references: list, hypotheses: list) -> float:
+        r"""
+        Args:
+            references (`list` of `str`):
+                Ground truth transcriptions.
+            hypotheses (`list` of `str`):
+                ASR output of the generated speech.
+
+        Returns:
+            `float`: Corpus level CER. Whitespace is collapsed but not dropped.
+        """
+        return cls._error_rate(references, hypotheses, lambda text: list(" ".join(text.split())))
+
+    @classmethod
+    def word_error_rate(cls, references: list, hypotheses: list) -> float:
+        r"""
+        Args:
+            references (`list` of `str`):
+                Ground truth transcriptions.
+            hypotheses (`list` of `str`):
+                ASR output of the generated speech.
+
+        Returns:
+            `float`: Corpus level WER over whitespace tokens.
+        """
+        return cls._error_rate(references, hypotheses, lambda text: text.split())
 
     # -----------------------------------------------------------------
     # Generation quality
