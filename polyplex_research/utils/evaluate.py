@@ -605,9 +605,642 @@ class SilentAssistantLogitsProcessor:
         return scores
 
 
+class Phase1Scorer:
+    r"""
+    Constructs the scorer of Phase 1 runs: Korean, English and timing losses, the same-meaning comparison with
+    English, and generation checks.
+
+    Every number is read off the model's own forward, so whatever a run adds inside the backbone is part of
+    what is scored.
+
+    Args:
+        model_name_or_path (`str`):
+            Expanded checkpoint the runs were trained on.
+        batch_size (`int`, *optional*, defaults to 16):
+            Utterances scored at a time.
+        max_frames (`int`, *optional*, defaults to 320):
+            Hard cap on the length of an item, in frames.
+        persona (`str`, *optional*, defaults to `"You are a helpful assistant."`):
+            Instruction of the persona prefix used in generation.
+    """
+
+    def __init__(
+        self,
+        model_name_or_path: str,
+        batch_size: int = 16,
+        max_frames: int = 320,
+        persona: str = "You are a helpful assistant.",
+    ):
+        from ..models.polyplex import PolyplexProcessor
+
+        self.model_name_or_path = model_name_or_path
+        self.batch_size = batch_size
+        self.max_frames = max_frames
+        self.persona = persona
+        self.processor = PolyplexProcessor.from_pretrained(model_name_or_path)
+        self.processor.audio_tokenizer.to("cuda")
+
+    def load_run(self, run_dir: str):
+        r"""
+        Args:
+            run_dir (`str`):
+                Directory of a Phase 1 run or checkpoint.
+
+        Returns:
+            `EfficientAdapterP1Model`: The run's model on the GPU, in evaluation mode.
+        """
+        from .assemble import Phase1Assemble
+
+        return Phase1Assemble.from_run(self.model_name_or_path, run_dir).cuda()
+
+    @staticmethod
+    def korean_items(path: str, exclude: str | None = None) -> tuple:
+        r"""
+        Args:
+            path (`str`):
+                Duplex cache of the Korean set.
+            exclude (`str`, *optional*):
+                Duplex cache whose texts are left out, so a validation set does not score sentences the run
+                trained on.
+
+        Returns:
+            `tuple`: The items and their total character count without spaces.
+        """
+        from ..datasets.duplex_data import DuplexUtteranceDataset
+
+        dataset = DuplexUtteranceDataset(path)
+        banned = set()
+        if exclude:
+            with open(os.path.join(exclude, "index.jsonl")) as handle:
+                banned = {json.loads(line)["text"] for line in handle}
+        keep = [index for index, entry in enumerate(dataset.entries) if entry["text"] not in banned]
+        characters = sum(len(dataset.entries[index]["text"].replace(" ", "")) for index in keep)
+        return [dataset[index] for index in keep], characters
+
+    @staticmethod
+    def english_items(path: str) -> list:
+        r"""
+        Args:
+            path (`str`):
+                `torch.save` of English utterances carrying `text` and their own `codes`.
+
+        Returns:
+            `list`: Items in the form the collator reads.
+        """
+        return [
+            {"codes": torch.as_tensor(e.codes)[:8].long(), "words": e.text.split(), "starts": [0.0] * len(e.text.split())}
+            for e in torch.load(path, weights_only=False)
+        ]
+
+    @staticmethod
+    def paced_item(text: str, tokenizer, frames_per_piece: float = 4.049) -> dict:
+        r"""
+        Lays a sentence out at a fixed rhythm, for comparing languages on the same meaning.
+
+        Args:
+            text (`str`):
+                The sentence.
+            tokenizer (`PreTrainedTokenizerBase`):
+                Tokenizer of the text stream.
+            frames_per_piece (`float`, *optional*, defaults to 4.049):
+                Frames each text piece is given.
+
+        Returns:
+            `dict`: An item with placeholder `codes` (silence replaces them), `words` and `starts`.
+        """
+        words, starts, pieces = text.split(), [], 0
+        for word in words:
+            # The first word is announced on the frame before it, so it starts a few frames in.
+            starts.append(pieces * frames_per_piece / 12.5 + 0.4)
+            pieces += max(1, len(tokenizer.encode(" " + word, add_special_tokens=False)))
+        frames = int((pieces + 2) * frames_per_piece) + 8
+        return {"codes": torch.zeros(8, frames, dtype=torch.long), "words": words, "starts": starts}
+
+    def _collate(self, model, drop_audio: bool, layout=None):
+        from ..datasets.duplex_data import duplex_collate_fn
+
+        return duplex_collate_fn(
+            self.processor, model.model, score_words_only=False, drop_audio=drop_audio,
+            max_frames=self.max_frames, layout=layout,
+        )
+
+    @torch.no_grad()
+    def score_korean(self, model, items: list, drop_audio: bool) -> dict:
+        r"""
+        Args:
+            model (`EfficientAdapterP1Model`):
+                The run's model.
+            items (`list`):
+                Korean items, see [`~Phase1Scorer.korean_items`].
+            drop_audio (`bool`):
+                Whether the assistant stream is codec silence (the condition Phase 1 trains in) or the
+                utterance's own speech.
+
+        Returns:
+            `dict`: `korean` (word frame loss), `korean_new` (word frames whose target is a new token),
+            `korean_sum`, `timing` (`PAD` and `EPAD` frames), `timing_cost` (the same minus its value with the
+            new embeddings left out) and `word_frames`.
+        """
+        import torch.nn.functional as F
+
+        from ..datasets.duplex_data import EPAD_TOKEN_ID, PAD_TOKEN_ID
+
+        collate = self._collate(model, drop_audio)
+        base = model.config.base_vocab_size
+        sums = dict.fromkeys(("word", "new", "timing", "timing_alone"), 0.0)
+        counts = dict.fromkeys(("word", "new", "timing"), 0)
+        for start in range(0, len(items), self.batch_size):
+            batch = {key: value.cuda() for key, value in collate(items[start : start + self.batch_size]).items()}
+            labels = batch.pop("text_labels")[:, 1:]
+            logits = model(**batch).logits[:, :-1].float()
+            scored = labels != -100
+            timing = scored & ((labels == PAD_TOKEN_ID) | (labels == EPAD_TOKEN_ID))
+            word = scored & ~timing
+            new = word & (labels >= base)
+            loss = F.cross_entropy(logits.transpose(1, 2), labels.clamp(min=0), reduction="none")
+            alone = F.cross_entropy(
+                logits[..., :base].transpose(1, 2), labels.clamp(min=0, max=base - 1), reduction="none"
+            )
+            sums["word"] += loss[word].sum().item()
+            counts["word"] += int(word.sum())
+            sums["new"] += loss[new].sum().item()
+            counts["new"] += int(new.sum())
+            sums["timing"] += loss[timing].sum().item()
+            sums["timing_alone"] += alone[timing].sum().item()
+            counts["timing"] += int(timing.sum())
+        return {
+            "korean": sums["word"] / counts["word"],
+            "korean_new": sums["new"] / max(counts["new"], 1),
+            "korean_sum": sums["word"],
+            "timing": sums["timing"] / counts["timing"],
+            "timing_cost": (sums["timing"] - sums["timing_alone"]) / counts["timing"],
+            "word_frames": counts["word"],
+        }
+
+    @torch.no_grad()
+    def score_english(self, model, items: list) -> dict:
+        r"""
+        Args:
+            model (`EfficientAdapterP1Model`):
+                The run's model.
+            items (`list`):
+                English items with their own speech, see [`~Phase1Scorer.english_items`].
+
+        Returns:
+            `dict`: `english` (word frame loss), `english_cost` (minus its value with the new embeddings left
+            out), and `drift_word` and `drift_timing` (KL from the model with its backbone corrections off to
+            the model as it is, on the pretrained vocabulary).
+        """
+        import torch.nn.functional as F
+
+        from ..datasets.duplex_data import EPAD_TOKEN_ID, PAD_TOKEN_ID, packed_words
+
+        collate = self._collate(model, drop_audio=False, layout=packed_words)
+        base = model.config.base_vocab_size
+        sums = dict.fromkeys(("full", "alone", "drift_word", "drift_timing"), 0.0)
+        counts = dict.fromkeys(("word", "timing"), 0)
+        for start in range(0, len(items), self.batch_size):
+            batch = {key: value.cuda() for key, value in collate(items[start : start + self.batch_size]).items()}
+            labels = batch.pop("text_labels")[:, 1:]
+            logits = model(**batch).logits[:, :-1].float()
+            with model.corrections_disabled():
+                original = model(**batch).logits[:, :-1].float()
+            scored = labels != -100
+            timing = scored & ((labels == PAD_TOKEN_ID) | (labels == EPAD_TOKEN_ID))
+            word = scored & ~timing
+            sums["full"] += F.cross_entropy(logits[word], labels[word], reduction="sum").item()
+            sums["alone"] += F.cross_entropy(logits[word][:, :base], labels[word], reduction="sum").item()
+            reference = original[..., :base].log_softmax(-1)
+            current = logits[..., :base].log_softmax(-1)
+            kl = (reference.exp() * (reference - current)).sum(-1)
+            sums["drift_word"] += kl[word].sum().item()
+            sums["drift_timing"] += kl[timing].sum().item()
+            counts["word"] += int(word.sum())
+            counts["timing"] += int(timing.sum())
+        return {
+            "english": sums["full"] / counts["word"],
+            "english_cost": (sums["full"] - sums["alone"]) / counts["word"],
+            "drift_word": sums["drift_word"] / counts["word"],
+            "drift_timing": sums["drift_timing"] / max(counts["timing"], 1),
+        }
+
+    @torch.no_grad()
+    def score_parallel(self, model, pairs: list, frames_per_piece: float = 4.049) -> dict:
+        r"""
+        Scores Korean against English on the same meaning, under the silent condition.
+
+        Args:
+            model (`EfficientAdapterP1Model`):
+                The run's model.
+            pairs (`list`):
+                `{"ko": ..., "en": ...}` sentence pairs.
+            frames_per_piece (`float`, *optional*, defaults to 4.049):
+                Rhythm both sides are laid out at, see [`~Phase1Scorer.paced_item`].
+
+        Returns:
+            `dict`: For `korean`, `english_off` (backbone corrections off) and `english_on`, the word frame
+            loss per token and per sentence.
+        """
+        import torch.nn.functional as F
+
+        from ..datasets.duplex_data import EPAD_TOKEN_ID, PAD_TOKEN_ID
+
+        tokenizer = self.processor.tokenizer
+        collate = self._collate(model, drop_audio=True)
+
+        def score(items):
+            total = count = 0.0
+            for item in items:
+                batch = {key: value.cuda() for key, value in collate([item]).items()}
+                labels = batch.pop("text_labels")[:, 1:]
+                logits = model(**batch).logits[:, :-1].float()
+                word = (labels != -100) & (labels != PAD_TOKEN_ID) & (labels != EPAD_TOKEN_ID)
+                loss = F.cross_entropy(logits.transpose(1, 2), labels.clamp(min=0), reduction="none")[word]
+                total += loss.sum().item()
+                count += word.sum().item()
+            return {"per_token": total / count, "per_sentence": total / len(items)}
+
+        korean = [self.paced_item(pair["ko"], tokenizer, frames_per_piece) for pair in pairs]
+        english = [self.paced_item(pair["en"], tokenizer, frames_per_piece) for pair in pairs]
+        result = {"korean": score(korean)}
+        with model.corrections_disabled():
+            result["english_off"] = score(english)
+        result["english_on"] = score(english)
+        return result
+
+    def opening_stream(self, words: list, frames_per_piece: float = 4.049) -> list:
+        r"""
+        Args:
+            words (`list`):
+                Opening words to force.
+            frames_per_piece (`float`, *optional*, defaults to 4.049):
+                Rhythm the words are laid out at.
+
+        Returns:
+            `list`: Text token of every forced frame.
+        """
+        from ..datasets.duplex_data import text_stream
+
+        tokenizer = self.processor.tokenizer
+        starts, pieces = [], 0
+        for word in words:
+            starts.append(pieces * frames_per_piece / 12.5)
+            pieces += max(1, len(tokenizer.encode(" " + word, add_special_tokens=False)))
+        frames = int((pieces + 1) * frames_per_piece) + 1
+        # Offset 1 leaves room for the announcing EPAD of the first word.
+        return text_stream(words, starts, frames, tokenizer, offset=1).tolist()
+
+    @torch.no_grad()
+    def generate(
+        self, model, steps: int, seed: int, stream: list | None = None, silent: bool = False, return_codes: bool = False
+    ):
+        r"""
+        Generates with the official `generate`, optionally forcing the opening words and the silent condition.
+
+        Args:
+            model (`PolyplexForConditionalGeneration`):
+                The folded model, see [`EfficientAdapterP1Model.fold_into_base`].
+            steps (`int`):
+                Frames generated.
+            seed (`int`):
+                Sampling seed.
+            stream (`list`, *optional*):
+                Text tokens forced on the first frames, see [`~Phase1Scorer.opening_stream`].
+            silent (`bool`, *optional*, defaults to `False`):
+                Whether the assistant codebooks are pinned to codec silence.
+            return_codes (`bool`, *optional*, defaults to `False`):
+                Whether the assistant's generated codes are returned with the text.
+
+        Returns:
+            `str`, or `tuple` of the text and the codes of shape `(num_codebooks, steps)` with `return_codes`.
+        """
+        from transformers import LogitsProcessorList
+
+        torch.manual_seed(seed)
+        inputs = self.processor(text_prompt=self.persona).to("cuda")
+        user = self.processor.get_silence_audio_codes(steps + 1, batch_size=1).to("cuda")
+        inputs["user_audio_codes"] = torch.cat([inputs["user_audio_codes"], user], dim=2)
+        extra = {}
+        if stream is not None:
+            extra["logits_processor"] = LogitsProcessorList([ForceTextLogitsProcessor(stream)])
+        if silent:
+            silence = self.processor.get_silence_audio_codes(steps + 1)[0].tolist()
+            extra["depth_decoder_logits_processor"] = LogitsProcessorList([SilentAssistantLogitsProcessor(silence)])
+        output = model.generate(
+            **inputs, max_new_tokens=steps, do_sample=True, temperature=0.8, top_k=250, return_audio_codes=True, **extra
+        )
+        prompt = inputs["input_ids"].shape[-1]
+        text = self.processor.tokenizer.decode(output.sequences[0, prompt:], skip_special_tokens=True).strip()
+        if not return_codes:
+            return text
+        return text, output.audio_codes[0, :, -steps:]
+
+
+CAPACITY_GROUPS = ("deploy_en_speech", "deploy_silent_pad", "empty_ko", "empty_en", "speech_ko")
 """Frame groups of the capacity measurement. The two `deploy_` groups are what deployment reads (English with its
 own speech, and `PAD` frames of an assistant that is listening), `empty_ko` and `empty_en` are word and `EPAD`
 frames under a silent assistant stream, and `speech_ko` are Korean word frames with their own speech."""
+
+CAPACITY_MODULES = ("attention", "ffn")
+
+
+class CapacityMeter:
+    r"""
+    Constructs a meter of how much room each backbone layer leaves for capacity that only the empty space reads.
+
+    Nothing is trained. The frozen backbone is run over the frame groups of [`CAPACITY_GROUPS`], and the input of
+    every layer's attention (after `input_layernorm`, shared by q, k and v) and of its FFN (after
+    `post_attention_layernorm`) is accumulated as an uncentered second moment per group. A linear correction
+    reading an input `x` answers `W x`, so its output on a group is governed by that group's second moment.
+
+    Args:
+        model (`EfficientAdapterP1Model`):
+            The assembled Phase 1 model, in evaluation mode on the GPU.
+        processor (`PolyplexProcessor`):
+            Processor of the expanded checkpoint.
+        max_frames (`int`, *optional*, defaults to 320):
+            Hard cap on the length of an item, in frames.
+        batch_size (`int`, *optional*, defaults to 16):
+            Utterances run at a time.
+    """
+
+    def __init__(self, model, processor, max_frames: int = 320, batch_size: int = 16):
+        self.model = model
+        self.processor = processor
+        self.max_frames = max_frames
+        self.batch_size = batch_size
+        self.layers = model.model.model.layers
+        hidden_size = self.layers[0].hidden_size
+        device = next(self.layers.parameters()).device
+        self.moments = {
+            (group, index, module): torch.zeros(hidden_size, hidden_size, dtype=torch.float32, device=device)
+            for group in CAPACITY_GROUPS
+            for index in range(len(self.layers))
+            for module in CAPACITY_MODULES
+        }
+        self.counts = dict.fromkeys(CAPACITY_GROUPS, 0)
+        self.masks = {}
+        self.handles = []
+        for index, layer in enumerate(self.layers):
+            self.handles.append(layer.self_attn.q_proj.register_forward_pre_hook(self._hook(index, "attention")))
+            self.handles.append(layer.mlp.fc1.register_forward_pre_hook(self._hook(index, "ffn")))
+
+    def _hook(self, index: int, module: str):
+        def hook(_, args):
+            hidden = args[0]
+            for group, mask in self.masks.items():
+                rows = hidden[mask].float()
+                if rows.shape[0]:
+                    self.moments[(group, index, module)].addmm_(rows.T, rows)
+
+        return hook
+
+    @staticmethod
+    def frame_masks(batch: dict, kind: str) -> dict:
+        r"""
+        Args:
+            batch (`dict`):
+                A collated duplex batch.
+            kind (`str`):
+                Which corpus the batch came from: `"en_speech"`, `"en_silent"`, `"ko_silent"` or `"ko_speech"`.
+
+        Returns:
+            `dict`: Boolean `(batch_size, sequence_length)` masks of the groups this batch feeds, selected by the
+            text token each frame reads.
+        """
+        from ..datasets.duplex_data import PAD_TOKEN_ID
+
+        ids = batch["input_ids"]
+        body = batch["text_labels"] != -100
+        pad = body & (ids == PAD_TOKEN_ID)
+        words = body & (ids != PAD_TOKEN_ID)
+        if kind == "en_speech":
+            return {"deploy_en_speech": body}
+        if kind == "en_silent":
+            return {"deploy_silent_pad": pad, "empty_en": words}
+        if kind == "ko_silent":
+            return {"deploy_silent_pad": pad, "empty_ko": words}
+        return {"speech_ko": words}
+
+    @torch.no_grad()
+    def collect(self, items: list, kind: str, drop_audio: bool, layout=None):
+        r"""
+        Runs the backbone over one corpus and adds its frames to the groups `kind` feeds.
+
+        Args:
+            items (`list`):
+                Utterances with `codes`, `words` and `starts`.
+            kind (`str`):
+                See [`~CapacityMeter.frame_masks`].
+            drop_audio (`bool`):
+                Whether the assistant stream is replaced by codec silence.
+            layout (`Callable`, *optional*):
+                Text layout passed to [`duplex_collate_fn`], the aligned one when omitted.
+        """
+        from ..datasets.duplex_data import duplex_collate_fn
+
+        collate = duplex_collate_fn(
+            self.processor, self.model.model, score_words_only=False, drop_audio=drop_audio,
+            max_frames=self.max_frames, layout=layout,
+        )
+        for start in range(0, len(items), self.batch_size):
+            batch = {key: value.cuda() for key, value in collate(items[start : start + self.batch_size]).items()}
+            self.masks = self.frame_masks(batch, kind)
+            for group, mask in self.masks.items():
+                self.counts[group] += int(mask.sum())
+            batch.pop("text_labels")
+            self.model(**batch)
+        self.masks = {}
+
+    def close(self):
+        r"""
+        Removes the hooks from the backbone.
+        """
+        for handle in self.handles:
+            handle.remove()
+
+    @staticmethod
+    def analyze(moment: dict, counts: dict) -> dict:
+        r"""
+        Args:
+            moment (`dict`):
+                Second moment of every group for one layer and module.
+            counts (`dict`):
+                Frames behind every group.
+
+        Returns:
+            `dict`: `protected_rank_99` and `_999` (directions holding that share of the deploy energy),
+            `empty_outside_*` (share of the Korean silent energy outside them), `allowed_rank` (complement
+            directions where the Korean silent energy is at least 100 times the deploy energy and at least 0.1%
+            of the total), `allowed_empty_share`, and `wiring_reach` (share of the Korean speech energy on the
+            allowed directions).
+        """
+        normalized = {group: moment[group] / max(counts[group], 1) for group in CAPACITY_GROUPS}
+        deploy = 0.5 * (normalized["deploy_en_speech"] + normalized["deploy_silent_pad"])
+        values, vectors = torch.linalg.eigh(deploy.double())
+        values, vectors = values.flip(0).clamp(min=0), vectors.flip(1)
+        share = values.cumsum(0) / values.sum()
+
+        empty = normalized["empty_ko"].double()
+        speech = normalized["speech_ko"].double()
+        english = normalized["empty_en"].double()
+        report = {}
+        for threshold, name in ((0.99, "99"), (0.999, "999")):
+            rank = int((share < threshold).sum()) + 1
+            basis = vectors[:, :rank]
+            outside = torch.eye(basis.shape[0], dtype=basis.dtype, device=basis.device) - basis @ basis.T
+            report[f"protected_rank_{name}"] = rank
+            report[f"empty_outside_{name}"] = float(torch.trace(outside @ empty @ outside) / torch.trace(empty))
+            report[f"empty_en_outside_{name}"] = float(
+                torch.trace(outside @ english @ outside) / torch.trace(english).clamp(min=1e-12)
+            )
+            report[f"speech_ko_outside_{name}"] = float(torch.trace(outside @ speech @ outside) / torch.trace(speech))
+
+        basis = vectors[:, : report["protected_rank_99"]]
+        outside = torch.eye(basis.shape[0], dtype=basis.dtype, device=basis.device) - basis @ basis.T
+        residual_values, residual_vectors = torch.linalg.eigh(outside @ empty @ outside)
+        residual_values, residual_vectors = residual_values.flip(0), residual_vectors.flip(1)
+        deploy_energy = torch.einsum("hd,he,ed->d", residual_vectors, deploy.double(), residual_vectors)
+        empty_energy = residual_values.clamp(min=0)
+        allowed = (empty_energy >= 1e-3 * torch.trace(empty)) & (empty_energy >= 100 * deploy_energy.clamp(min=1e-12))
+        allowed_vectors = residual_vectors[:, allowed]
+        report["allowed_rank"] = int(allowed.sum())
+        report["allowed_empty_share"] = float(empty_energy[allowed].sum() / torch.trace(empty))
+        report["wiring_reach"] = (
+            float(torch.trace(allowed_vectors.T @ speech @ allowed_vectors) / torch.trace(speech))
+            if allowed_vectors.shape[1]
+            else 0.0
+        )
+        return report
+
+    def write(self, output_dir: str) -> dict:
+        r"""
+        Writes the per layer second moments (`moments_<layer>_<module>.pt`) and the analysis (`report.json`).
+
+        Args:
+            output_dir (`str`):
+                Directory written to.
+
+        Returns:
+            `dict`: The report.
+        """
+        os.makedirs(output_dir, exist_ok=True)
+        report = {"counts": self.counts, "layers": []}
+        for index in range(len(self.layers)):
+            row = {"layer": index}
+            for module in CAPACITY_MODULES:
+                moment = {group: self.moments[(group, index, module)] for group in CAPACITY_GROUPS}
+                row[module] = self.analyze(moment, self.counts)
+                torch.save(
+                    {group: (value / max(self.counts[group], 1)).half().cpu() for group, value in moment.items()},
+                    os.path.join(output_dir, f"moments_{index:02d}_{module}.pt"),
+                )
+            report["layers"].append(row)
+        with open(os.path.join(output_dir, "report.json"), "w") as handle:
+            json.dump(report, handle, indent=1)
+        return report
+
+
+def measure_capacity(
+    model_dir: str,
+    adapter_dir: str,
+    output_dir: str,
+    english_speech: str,
+    korean_text: str,
+    korean_speech: str,
+    limit: int = 800,
+    batch_size: int = 16,
+    max_frames: int = 320,
+) -> dict:
+    r"""
+    Runs [`CapacityMeter`] over the four corpora and writes its moments and report.
+
+    Args:
+        model_dir (`str`):
+            Expanded checkpoint.
+        adapter_dir (`str`):
+            Phase 1 run whose new embeddings the Korean tokens are read with.
+        output_dir (`str`):
+            Directory the report and the moments are written to.
+        english_speech (`str`):
+            `torch.save` of English utterances with `codes` and `text`.
+        korean_text (`str`):
+            Duplex cache of the Korean text corpus.
+        korean_speech (`str`):
+            Duplex cache of Korean utterances with speech.
+        limit (`int`, *optional*, defaults to 800):
+            Utterances read from each corpus.
+        batch_size (`int`, *optional*, defaults to 16):
+            Utterances run at a time.
+        max_frames (`int`, *optional*, defaults to 320):
+            Hard cap on the length of an item, in frames.
+
+    Returns:
+        `dict`: The report.
+    """
+    from ..datasets.duplex_data import DuplexUtteranceDataset, packed_words
+    from ..models.polyplex import PolyplexProcessor
+    from .assemble import Phase1Assemble
+    from .phase import load_adapter_slices
+
+    model, _ = Phase1Assemble(model_dir, base_row_mixture=64, tie_new_input_rows=True).assemble()
+    load_adapter_slices(model, adapter_dir)
+    model = model.cuda().eval()
+    processor = PolyplexProcessor.from_pretrained(model_dir)
+    processor.audio_tokenizer.to("cuda")
+
+    english = [
+        {"codes": torch.as_tensor(e.codes)[:8].long(), "words": e.text.split(), "starts": [0.0] * len(e.text.split())}
+        for e in torch.load(english_speech, weights_only=False)[:limit]
+    ]
+
+    def sample(path):
+        dataset = DuplexUtteranceDataset(path)
+        order = torch.randperm(len(dataset), generator=torch.Generator().manual_seed(0))[: min(limit, len(dataset))]
+        return [dataset[int(index)] for index in order]
+
+    meter = CapacityMeter(model, processor, max_frames, batch_size)
+    meter.collect(english, "en_speech", drop_audio=False, layout=packed_words)
+    meter.collect(english, "en_silent", drop_audio=True, layout=packed_words)
+    meter.collect(sample(korean_text), "ko_silent", drop_audio=True)
+    meter.collect(sample(korean_speech), "ko_speech", drop_audio=False)
+    meter.close()
+    return meter.write(output_dir)
+
+
+def build_confined_basis(moments_dir: str, layers: str, rank: int, module: str, output: str) -> int:
+    r"""
+    Writes the input directions a confined correction reads at each chosen layer, for `confined_basis`.
+
+    Args:
+        moments_dir (`str`):
+            Directory [`CapacityMeter.write`] wrote.
+        layers (`str`):
+            Inclusive layer range such as `"8-31"`.
+        rank (`int`):
+            Directions per layer.
+        module (`str`):
+            `"ffn"` or `"attention"`.
+        output (`str`):
+            Safetensors file written, keyed `layer_<index>`.
+
+    Returns:
+        `int`: Number of layers written.
+    """
+    from safetensors.torch import save_file
+
+    from ..adapters.phase_1_efficient_adapter.modeling_phase_1_efficient_adapter import ConfinedCapacity
+
+    first, last = (int(value) for value in layers.split("-"))
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    tensors = {}
+    for index in range(first, last + 1):
+        moments = torch.load(os.path.join(moments_dir, f"moments_{index:02d}_{module}.pt"))
+        moments = {group: value.to(device) for group, value in moments.items()}
+        tensors[f"layer_{index}"] = ConfinedCapacity.directions_from_moments(moments, rank).cpu().contiguous()
+    save_file(tensors, output)
+    return len(tensors)
+
 
 """The held out English speech set (`train.sh` `SCORE_ENGLISH_SPEECH`)."""
 
@@ -620,7 +1253,12 @@ if __name__ == "__main__":
 
 
 __all__ = [
+    "CAPACITY_GROUPS",
+    "CapacityMeter",
     "Evaluator",
     "ForceTextLogitsProcessor",
+    "Phase1Scorer",
     "SilentAssistantLogitsProcessor",
+    "build_confined_basis",
+    "measure_capacity",
 ]
