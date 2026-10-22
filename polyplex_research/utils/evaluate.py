@@ -1242,10 +1242,1056 @@ def build_confined_basis(moments_dir: str, layers: str, rank: int, module: str, 
     return len(tensors)
 
 
+def language_model_continuation(
+    model, tokenizer, prompt: str, max_new_tokens: int = 60, temperature: float = 0.0, top_k: int = 50, seed: int = 0
+) -> str:
+    r"""
+    Continues a text prompt with a text LLM and its own tokenizer, the reference the dense samples are read against:
+    greedily, or sampled from the `top_k` most likely tokens at `temperature`.
+
+    Args:
+        model (`PreTrainedModel`):
+            The text LLM, in evaluation mode.
+        tokenizer (`PreTrainedTokenizer`):
+            Its tokenizer.
+        prompt (`str`):
+            The opening text.
+        max_new_tokens (`int`, *optional*, defaults to 60):
+            Tokens generated after the prompt.
+        temperature (`float`, *optional*, defaults to 0.0):
+            Sampling temperature. `0` takes the most likely token.
+        top_k (`int`, *optional*, defaults to 50):
+            Tokens sampled from at each step.
+        seed (`int`, *optional*, defaults to 0):
+            Seed of the sampling.
+
+    Returns:
+        `str`: The generated text, without the prompt.
+    """
+    ids = torch.tensor([tokenizer.encode(prompt, add_special_tokens=False)], device=model.device)
+    sampling = {"do_sample": True, "temperature": temperature, "top_k": top_k} if temperature > 0 else {"do_sample": False}
+    if temperature > 0:
+        torch.manual_seed(seed)
+    with torch.no_grad():
+        output = model.generate(
+            ids,
+            attention_mask=torch.ones_like(ids),
+            max_new_tokens=max_new_tokens,
+            min_new_tokens=max_new_tokens,
+            **sampling,
+        )
+    return tokenizer.decode(output[0, ids.shape[1] :].tolist())
+
+
+def dense_generate(
+    model, collate, prompt: torch.Tensor, max_new_tokens: int = 80, temperature: float = 0.8, top_k: int = 50, seed: int = 0
+) -> torch.Tensor:
+    r"""
+    Continues a text prompt in the dense layout the first stage of Phase 1 trains in, with no PAD frames.
+
+    Every step reads the whole sequence again through [`~duplex_data.dense_collate_fn`], so the opening frame
+    and the codec silence are those of training. The appended vocabulary and the pretrained one are sampled
+    alike.
+
+    Args:
+        model (`EfficientAdapterP1Model`):
+            The model, in evaluation mode.
+        collate (`Callable`):
+            The collator of the dense stage.
+        prompt (`torch.Tensor` of shape `(length,)`):
+            Pieces of the opening text.
+        max_new_tokens (`int`, *optional*, defaults to 80):
+            Pieces generated after the prompt.
+        temperature (`float`, *optional*, defaults to 0.8):
+            Sampling temperature. `0` takes the most likely piece.
+        top_k (`int`, *optional*, defaults to 50):
+            Pieces sampled from at each step.
+        seed (`int`, *optional*, defaults to 0):
+            Seed of the sampling.
+
+    Returns:
+        `torch.Tensor` of shape `(max_new_tokens,)`: The generated pieces.
+    """
+    from ..datasets.duplex_data import PAD_TOKEN_ID
+
+    device = next(model.parameters()).device
+    generator = torch.Generator(device="cpu").manual_seed(seed)
+    vocab = model.config.vocab_size
+    pieces = torch.as_tensor(prompt, dtype=torch.long).cpu()
+    produced = []
+    for _ in range(max_new_tokens):
+        # The delay pattern rewrites the acoustic codes of a row's last frame, a frame training never reads a
+        # prediction from, so one padding frame follows the prompt and the prediction is read before it.
+        padded = torch.cat([pieces, torch.tensor([PAD_TOKEN_ID])])
+        batch = collate([{"segments": [padded]}])
+        inputs = {k: v.to(device) for k, v in batch.items() if k != "text_labels"}
+        with torch.no_grad():
+            logits = model(**inputs).logits[0, len(pieces), :vocab].float().cpu()
+        if temperature <= 0:
+            choice = int(logits.argmax())
+        else:
+            values, indices = logits.topk(min(top_k, vocab))
+            probs = torch.softmax(values / temperature, dim=-1)
+            choice = int(indices[torch.multinomial(probs, 1, generator=generator)])
+        produced.append(choice)
+        pieces = torch.cat([pieces, torch.tensor([choice])])
+    return torch.tensor(produced, dtype=torch.long)
+
+
+_HANGUL = re.compile("[\uac00-\ud7a3]")
+_DIGITS = re.compile(r"▁?[0-9]+")
+_LATIN = re.compile("[A-Za-z]")
+
+
 """The held out English speech set (`train.sh` `SCORE_ENGLISH_SPEECH`)."""
 
 
+def piece_kind(piece: str, previous: str | None) -> str:
+    r"""
+    Names what a text piece is, for scoring the dense stage by kind of piece.
+
+    A Hangul or Latin piece starts a word when it carries the space marker `▁` or follows a piece that is the
+    marker alone. Every other such piece continues the word before it.
+
+    Args:
+        piece (`str`):
+            The piece as the tokenizer spells it.
+        previous (`str`, *optional*):
+            The piece before it, `None` at the start of a document.
+
+    Returns:
+        `str`: One of `hangul_word_start`, `hangul_inside_word`, `latin_word_start`, `latin_inside_word`, `space`,
+        `digits`, `byte` and `punctuation`.
+    """
+    if piece.startswith("<0x"):
+        return "byte"
+    if piece == "▁":
+        return "space"
+    if _HANGUL.search(piece):
+        if piece.startswith("▁") or previous is None or previous == "▁":
+            return "hangul_word_start"
+        return "hangul_inside_word"
+    if _DIGITS.fullmatch(piece):
+        return "digits"
+    if _LATIN.search(piece):
+        if piece.startswith("▁") or previous is None or previous == "▁":
+            return "latin_word_start"
+        return "latin_inside_word"
+    return "punctuation"
+
+
+def piece_kind_scores(model, collate, rows: list, tokenizer, batch_size: int = 8, base_only: bool = False) -> dict:
+    r"""
+    Scores packed dense rows by kind of target piece (see [`piece_kind`]).
+
+    Args:
+        model (`EfficientAdapterP1Model`):
+            The model, in evaluation mode.
+        collate (`Callable`):
+            The collator of the dense stage.
+        rows (`list[dict]`):
+            Rows of [`~phase_data.DenseTextDataset`].
+        tokenizer (`PreTrainedTokenizerBase`):
+            Tokenizer of the text stream.
+        batch_size (`int`, *optional*, defaults to 8):
+            Rows per forward pass.
+        base_only (`bool`, *optional*, defaults to `False`):
+            Score the pretrained vocabulary alone: the softmax runs over the pretrained rows and appended
+            targets are skipped. With the corrections disabled this is the original model.
+
+    Returns:
+        `dict`: For each kind, its `share` of the scored pieces, mean `loss`, `ppl` and `top1` accuracy, plus
+        `all`.
+    """
+    import torch.nn.functional as F
+
+    device = next(model.parameters()).device
+    vocab = model.config.vocab_size
+    names = tokenizer.convert_ids_to_tokens(list(range(vocab)))
+    sums = {}
+    for start in range(0, len(rows), batch_size):
+        batch = collate(rows[start : start + batch_size])
+        inputs = {k: v.to(device) for k, v in batch.items() if k != "text_labels"}
+        with torch.no_grad():
+            logits = model(**inputs).logits[:, :-1].float()
+        labels = batch["text_labels"][:, 1:].clone()
+        if base_only:
+            base = model.config.base_vocab_size
+            logits = logits[..., :base]
+            labels[labels >= base] = -100
+        previous = batch["input_ids"][:, :-1]
+        losses = F.cross_entropy(logits.transpose(1, 2), labels.to(device).clamp(min=0), reduction="none").cpu()
+        hits = (logits.argmax(-1).cpu() == labels)
+        for row, column in (labels != -100).nonzero().tolist():
+            before = int(previous[row, column])
+            kind = piece_kind(names[int(labels[row, column])], names[before] if before < vocab else None)
+            for key in (kind, "all"):
+                total = sums.setdefault(key, [0.0, 0, 0])
+                total[0] += float(losses[row, column])
+                total[1] += 1
+                total[2] += int(hits[row, column])
+    count = sums["all"][1]
+    return {
+        key: {"share": n / count, "loss": s / n, "ppl": math.exp(s / n), "top1": h / n}
+        for key, (s, n, h) in sums.items()
+    }
+
+
+def dense_checks(model, collate, rows: list, base_vocab_size: int, unigram_log_probs: torch.Tensor, seed: int = 0) -> dict:
+    r"""
+    Checks that a loss on packed dense rows measures prediction from context and nothing else.
+
+    Four readings on the same rows. The loss itself, split into appended and pretrained vocabulary targets.
+    The loss with the pieces of every document shuffled, which rises well above it only if the model reads
+    its context. The loss a unigram model gives the same targets. And two leaks, as the largest change of a
+    logit: on the frames before a point when every piece after it is replaced (`future_leak`), and on the
+    second document of the first row when the first document is replaced (`document_leak`).
+
+    Args:
+        model (`EfficientAdapterP1Model`):
+            The model, in evaluation mode.
+        collate (`Callable`):
+            The collator of the dense stage, see [`~duplex_data.dense_collate_fn`].
+        rows (`list[dict]`):
+            Rows of [`~phase_data.DenseTextDataset`]. The first one must hold two documents at least.
+        base_vocab_size (`int`):
+            First row of the appended vocabulary.
+        unigram_log_probs (`torch.Tensor` of shape `(vocab_size,)`):
+            Log probability of each piece under a unigram model of the training text.
+        seed (`int`, *optional*, defaults to 0):
+            Seed of the shuffle and of the replacement pieces.
+
+    Returns:
+        `dict`: `loss`, `loss_new`, `loss_base`, `shuffled`, `unigram`, `scored`, `future_leak` and
+        `document_leak`.
+    """
+    device = next(model.parameters()).device
+    generator = torch.Generator().manual_seed(seed)
+
+    def logits_of(batch):
+        inputs = {k: v.to(device) for k, v in batch.items() if k != "text_labels"}
+        with torch.no_grad():
+            return model(**inputs).logits.float()
+
+    def losses(batch):
+        logits = logits_of(batch)[:, :-1]
+        labels = batch["text_labels"][:, 1:].to(device)
+        scored = labels != -100
+        per_token = torch.nn.functional.cross_entropy(logits[scored], labels[scored], reduction="none")
+        return per_token, labels[scored]
+
+    batch = collate(rows)
+    per_token, targets = losses(batch)
+    new = targets >= base_vocab_size
+    shuffled_rows = [
+        {"segments": [s[torch.randperm(len(s), generator=generator)] for s in row["segments"]]} for row in rows
+    ]
+    shuffled, _ = losses(collate(shuffled_rows))
+    unigram = -unigram_log_probs.to(device)[targets]
+
+    first = rows[0]["segments"]
+    reference = logits_of(collate([{"segments": first}]))[0]
+    cut = 1 + len(first[0]) // 2
+    replaced = [torch.cat([first[0][: cut - 1], torch.randint(0, base_vocab_size, (len(first[0]) - cut + 1,), generator=generator)])]
+    replaced += [torch.randint(0, base_vocab_size, (len(s),), generator=generator) for s in first[1:]]
+    future = logits_of(collate([{"segments": replaced}]))[0]
+    other = [torch.randint(0, base_vocab_size, (len(first[0]),), generator=generator)] + list(first[1:])
+    isolated = logits_of(collate([{"segments": other}]))[0]
+    second = 1 + len(first[0])
+
+    return {
+        "loss": per_token.mean().item(),
+        "loss_new": per_token[new].mean().item() if new.any() else float("nan"),
+        "loss_base": per_token[~new].mean().item() if (~new).any() else float("nan"),
+        "shuffled": shuffled.mean().item(),
+        "unigram": unigram.mean().item(),
+        "scored": int(targets.numel()),
+        "future_leak": (future[:cut] - reference[:cut]).abs().max().item(),
+        "document_leak": (isolated[second:] - reference[second:]).abs().max().item(),
+    }
+
+
+def unigram_log_probs(tokens, vocab_size: int, limit: int = 20_000_000) -> torch.Tensor:
+    r"""
+    Args:
+        tokens (`numpy.ndarray`):
+            Pieces of the training text end to end.
+        vocab_size (`int`):
+            Size of the vocabulary.
+        limit (`int`, *optional*, defaults to 20,000,000):
+            How many pieces from the start are counted.
+
+    Returns:
+        `torch.Tensor` of shape `(vocab_size,)`: Add-one smoothed log probability of every piece.
+    """
+    import numpy as np
+
+    counts = np.bincount(np.asarray(tokens[:limit], dtype=np.int64), minlength=vocab_size)[:vocab_size] + 1
+    return torch.from_numpy(np.log(counts / counts.sum())).float()
+
+
+def dense_unigram_baseline(rows: list, log_probs: torch.Tensor, tokenizer) -> dict:
+    r"""
+    Scores packed rows with a unigram model, the cross entropy a model reaches without reading any context.
+
+    The first piece of every document is left out, as the dense quick check leaves it out.
+
+    Args:
+        rows (`list`):
+            Rows with a `segments` list of token tensors, one per document.
+        log_probs (`torch.Tensor` of shape `(vocab_size,)`):
+            Log probability of every piece, from [`unigram_log_probs`].
+        tokenizer (`PreTrainedTokenizerBase`):
+            Tokenizer the pieces come from, to measure the text they spell.
+
+    Returns:
+        `dict`: `loss` (mean cross entropy per scored piece, in nats), `tokens` (scored pieces), and
+        `bytes_per_token` and `characters_per_token` of the scored text in UTF-8.
+    """
+    total, count, characters, utf8 = 0.0, 0, 0, 0
+    for row in rows:
+        for segment in row["segments"]:
+            scored = segment[1:].long()
+            if scored.numel() == 0:
+                continue
+            total -= log_probs[scored].double().sum().item()
+            count += scored.numel()
+            text = tokenizer.decode(scored.tolist())
+            characters += len(text)
+            utf8 += len(text.encode("utf-8"))
+    count = max(count, 1)
+    return {
+        "loss": total / count,
+        "tokens": count,
+        "bytes_per_token": utf8 / count,
+        "characters_per_token": characters / count,
+    }
+
+
+def frame_embedding_norms(text_embeds: torch.Tensor, audio_embeds: torch.Tensor, mask: torch.Tensor) -> dict:
+    r"""
+    Compares the two parts of a frame's input: the text embedding and the summed audio embeddings added to it.
+
+    Args:
+        text_embeds (`torch.Tensor` of shape `(batch_size, sequence_length, hidden_size)`):
+            Text embedding of every frame.
+        audio_embeds (`torch.Tensor` of shape `(batch_size, sequence_length, hidden_size)`):
+            Sum of the audio codebook embeddings of every frame.
+        mask (`torch.Tensor` of shape `(batch_size, sequence_length)`):
+            Frames to measure.
+
+    Returns:
+        `dict`: Mean L2 norm of the text part (`text`) and of the audio part (`audio`) over the frames, and
+        their ratio (`audio_over_text`).
+    """
+    text = text_embeds.float().norm(dim=-1)[mask].mean().item()
+    audio = audio_embeds.float().norm(dim=-1)[mask].mean().item()
+    return {"text": text, "audio": audio, "audio_over_text": audio / text}
+
+
+def dense_baselines(
+    personaplex: str,
+    language_model: str,
+    work_dir: str,
+    eval_rows: int = 64,
+    row_frames: int = 1024,
+    train_tokens: int = 2_000_000,
+    max_files: int = 1,
+) -> dict:
+    r"""
+    Reference points for the dense quick check, on the rows it scores: a unigram model per language, the text
+    each piece spells, and how large the silent audio input is next to the text input of the assembled model.
+
+    Args:
+        personaplex (`str`):
+            Duplex checkpoint, for its audio embeddings and the codec silence.
+        language_model (`str`):
+            Text LLM, for its tokenizer and its text embedding.
+        work_dir (`str`):
+            Directory the row caches are written to.
+        eval_rows (`int`, *optional*, defaults to 64):
+            Held out rows per language.
+        row_frames (`int`, *optional*, defaults to 1024):
+            Frames per row.
+        train_tokens (`int`, *optional*, defaults to 2,000,000):
+            Training pieces each language's unigram model is counted on.
+        max_files (`int`, *optional*, defaults to 1):
+            Parquet files read per language.
+
+    Returns:
+        `dict`: Per language, the result of [`dense_unigram_baseline`]; under `input_norms`, the result of
+        [`frame_embedding_norms`] on the Korean rows and the mean row norm of Helium's own text table.
+    """
+    import numpy as np
+    from huggingface_hub import hf_hub_download
+    from safetensors import safe_open
+    from transformers import AutoTokenizer, PersonaPlexForConditionalGeneration
+
+    from ..datasets.duplex_data import dense_collate_fn
+    from ..models.polyplex import PolyplexProcessor
+    from ..datasets.webtext import DENSE_EVALUATION
+    from .phase import dense_documents, dense_eval_rows
+
+    tokenizer = AutoTokenizer.from_pretrained(language_model)
+    vocab_size = len(tokenizer)
+    results, rows_by_language = {}, {}
+    for language in DENSE_EVALUATION:
+        rows = dense_eval_rows(language, tokenizer, work_dir, eval_rows, row_frames, max_files)
+        rows_by_language[language] = rows
+        pieces = [
+            piece
+            for text in dense_documents(language, "train", train_tokens, tokenizer, max_files)
+            for piece in tokenizer.encode(" ".join(text.split()), add_special_tokens=False)
+        ]
+        log_probs = unigram_log_probs(np.asarray(pieces), vocab_size)
+        results[language] = dense_unigram_baseline(rows, log_probs, tokenizer)
+        print(f"[dense-baselines] {language}: {results[language]}", flush=True)
+
+    index = json.load(open(hf_hub_download(language_model, "model.safetensors.index.json")))
+    shard = hf_hub_download(language_model, index["weight_map"]["model.embed_tokens.weight"])
+    with safe_open(shard, "pt") as weights:
+        text_table = weights.get_tensor("model.embed_tokens.weight").float()
+
+    helium = PersonaPlexForConditionalGeneration.from_pretrained(personaplex, torch_dtype=torch.bfloat16)
+    processor = PolyplexProcessor.from_pretrained(personaplex)
+    batch = dense_collate_fn(processor, helium)(rows_by_language["ko"][:8])
+    with torch.no_grad():
+        codes = torch.cat([batch["assistant_audio_codes"], batch["user_audio_codes"]], dim=1)
+        audio = helium._embed_audio_codes(codes)
+        opening = batch["position_ids"] == 0
+        text = text_table[batch["input_ids"].clamp(max=text_table.shape[0] - 1)]
+    results["input_norms"] = {
+        **frame_embedding_norms(text, audio, ~opening),
+        "helium_text_rows": helium.model.embed_tokens.weight.float().norm(dim=-1).mean().item(),
+        "qwen_text_rows": text_table.norm(dim=-1).mean().item(),
+    }
+    return results
+
+
+NVFP4_VARIANTS = {
+    "W4A4": {},
+    "W4 only": {"quantize_activations": False},
+    "W4A4, down_proj full": {"skip": "down_proj"},
+    "W4A4, MLP full": {"skip": "mlp"},
+    "W4A4, first and last 2 layers full": {"skip": "edges"},
+    "W4A4, Hadamard 128": {"hadamard_group_size": 128},
+}
 """NVFP4 variants `nvfp4-check` compares with full precision: what S7.1 runs, and the usual exceptions."""
+
+
+@torch.no_grad()
+def nvfp4_variant_losses(model, rows: list, variants: dict | None = None) -> dict:
+    r"""
+    Per-token cross entropy of a causal LM on `rows`, in full precision and with its decoder layers' projections
+    run through emulated NVFP4 ([`~quantization.emulate_linears_nvfp4`]) under each variant.
+
+    Args:
+        model (`PreTrainedModel`):
+            A causal LM whose decoder layers are `model.model.layers`.
+        rows (`list[list[int]]`):
+            Token rows. The first token of each row is context only.
+        variants (`dict`, *optional*):
+            Name mapped to options: `quantize_activations`, `hadamard_group_size`, and `skip`, one of `"down_proj"`,
+            `"mlp"` (every FFN projection) and `"edges"` (the first and last two layers). [`NVFP4_VARIANTS`] when
+            omitted.
+
+    Returns:
+        `dict`: `"full precision"` and each variant mapped to the mean cross entropy per predicted token.
+    """
+    from .quantization import emulate_linears_nvfp4
+
+    layers = model.model.layers
+    count = len(layers)
+    skips = {
+        "down_proj": lambda name: name.endswith("down_proj"),
+        "mlp": lambda name: ".mlp." in name,
+        "edges": lambda name: int(name.split(".")[0]) in {0, 1, count - 2, count - 1},
+    }
+
+    def loss() -> float:
+        total = tokens = 0.0
+        for row in rows:
+            ids = torch.tensor([row], device=model.device)
+            logits = model(input_ids=ids).logits[0, :-1].float()
+            total += torch.nn.functional.cross_entropy(logits, ids[0, 1:], reduction="sum").item()
+            tokens += len(row) - 1
+        return total / tokens
+
+    results = {"full precision": loss()}
+    for name, options in (NVFP4_VARIANTS if variants is None else variants).items():
+        options = dict(options)
+        skip = skips[options.pop("skip")] if "skip" in options else None
+        restore = emulate_linears_nvfp4(layers, skip=skip, **options)
+        try:
+            results[name] = loss()
+        finally:
+            restore()
+    return results
+
+
+class FFNRecorder(torch.nn.Module):
+    r"""
+    Wraps one FFN of a DualFFN layer and adds up, over every position after the first `skip` of a row, the squared
+    size of its input residual and of its output, and the sum and squared sum of its output per dimension
+    ([`language_ffn_report`]).
+
+    Args:
+        ffn (`nn.Module`):
+            The FFN.
+        skip (`int`):
+            Leading positions of each row left out.
+        keep (`int`, *optional*, defaults to 0):
+            Inputs kept, on the CPU, for a later look at the FFN's neurons ([`ffn_neuron_energy`]).
+    """
+
+    def __init__(self, ffn: torch.nn.Module, skip: int, keep: int = 0):
+        super().__init__()
+        self.ffn = ffn
+        self.skip = skip
+        self.keep = keep
+        self.reset()
+
+    def reset(self):
+        self.count = 0
+        self.output_sum = None
+        self.output_squares = None
+        self.inputs = []
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if sum(len(part) for part in self.inputs) < self.keep:
+            self.inputs.append(hidden_states[:, self.skip :].reshape(-1, hidden_states.shape[-1]).float().cpu())
+        output = self.ffn(hidden_states)
+        kept = output[:, self.skip :].float().reshape(-1, output.shape[-1])
+        self.count += kept.shape[0]
+        sums, squares = kept.sum(0), kept.square().sum(0)
+        self.output_sum = sums if self.output_sum is None else self.output_sum + sums
+        self.output_squares = squares if self.output_squares is None else self.output_squares + squares
+        return output
+
+
+@torch.no_grad()
+def language_ffn_report(model, collate, tokenizer, texts: list, skip: int = 4, top: int = 8, keep: dict | None = None) -> list:
+    r"""
+    Measures, layer by layer, how large the language FFN's output is beside the duplex FFN's and how much of it is the
+    same vector at every position (SPEC S11.2): texts are read as dense rows and both FFN outputs are recorded.
+
+    Args:
+        model ([`PolyplexForConditionalGeneration`]):
+            The DualFFN model.
+        collate (`Callable`):
+            [`~polyplex_research.datasets.duplex_data.dense_collate_fn`] of the model.
+        tokenizer (`PreTrainedTokenizerBase`):
+            The model's tokenizer.
+        texts (`list[str]`):
+            The texts.
+        skip (`int`, *optional*, defaults to 4):
+            Leading positions of each row left out.
+        top (`int`, *optional*, defaults to 8):
+            Dimensions counted in the share of the output's energy its largest dimensions carry.
+        keep (`dict[int, int]`, *optional*):
+            Layer mapped to how many language FFN inputs to return for it, under `inputs` in its entry.
+
+    Returns:
+        `list[dict]`: Per layer, the RMS of each FFN's output, the language FFN's over the duplex FFN's, the share of
+        the language FFN's energy in its mean vector (the part every position shares) and in its `top` largest
+        dimensions, and those dimensions.
+    """
+    device = next(model.parameters()).device
+    layers = model.model.layers
+    recorders = []
+    for layer in layers:
+        kept = (keep or {}).get(len(recorders), 0)
+        recorders.append((FFNRecorder(layer.mlp.language_mlp, skip, kept), FFNRecorder(layer.mlp.duplex_mlp, skip)))
+        layer.mlp.language_mlp, layer.mlp.duplex_mlp = recorders[-1]
+    try:
+        for text in texts:
+            ids = tokenizer.encode(text, add_special_tokens=False)
+            batch = {key: value.to(device) for key, value in collate([{"segments": [torch.tensor(ids)]}]).items()}
+            batch.pop("text_labels")
+            model(**batch, use_cache=False)
+    finally:
+        for layer, (language, duplex) in zip(layers, recorders):
+            layer.mlp.language_mlp, layer.mlp.duplex_mlp = language.ffn, duplex.ffn
+    report = []
+    for index, (language, duplex) in enumerate(recorders):
+        energy = language.output_squares / language.count
+        mean = language.output_sum / language.count
+        rms = energy.sum().sqrt() / energy.numel() ** 0.5
+        duplex_rms = (duplex.output_squares.sum() / duplex.count).sqrt() / energy.numel() ** 0.5
+        largest = energy.topk(top)
+        report.append(
+            {
+                "layer": index,
+                "language_rms": round(float(rms), 4),
+                "duplex_rms": round(float(duplex_rms), 4),
+                "language_over_duplex": round(float(rms / duplex_rms), 2),
+                "mean_share": round(float(mean.square().sum() / energy.sum()), 3),
+                "top_share": round(float(largest.values.sum() / energy.sum()), 3),
+                "top_dims": largest.indices.tolist(),
+            }
+        )
+        if language.inputs:
+            report[-1]["inputs"] = torch.cat(language.inputs)[: keep[index]]
+    return report
+
+
+@torch.no_grad()
+def ffn_neuron_energy(inputs: torch.Tensor, gate: torch.Tensor, up: torch.Tensor, down: torch.Tensor, top: int = 16) -> dict:
+    r"""
+    Ranks the intermediate neurons of a SwiGLU FFN by the energy they put into its output on given inputs: neuron
+    $j$ adds $a_j\,W_\text{down}[:, j]$, so its energy is the mean of $a_j^2$ times $\lVert W_\text{down}[:, j]\rVert^2$.
+
+    Args:
+        inputs (`torch.Tensor` of shape `(positions, hidden_size)`):
+            The normalized inputs the FFN reads.
+        gate (`torch.Tensor` of shape `(intermediate_size, hidden_size)`):
+            The gate projection.
+        up (`torch.Tensor` of shape `(intermediate_size, hidden_size)`):
+            The up projection.
+        down (`torch.Tensor` of shape `(hidden_size, intermediate_size)`):
+            The down projection.
+        top (`int`, *optional*, defaults to 16):
+            Neurons reported.
+
+    Returns:
+        `dict`: The `top` neurons, their share of the summed neuron energy, the mean activation of each, the share of
+        the output's energy that is left once they are removed, and the output dimensions each writes most to.
+    """
+    inputs = inputs.float()
+    activation = torch.nn.functional.silu(inputs @ gate.float().T) * (inputs @ up.float().T)
+    down = down.float()
+    energy = activation.square().mean(0) * down.square().sum(0)
+    largest = energy.topk(top)
+    output = activation @ down.T
+    kept = activation.clone()
+    kept[:, largest.indices] = 0
+    left = (kept @ down.T).square().sum() / output.square().sum()
+    return {
+        "neurons": largest.indices.tolist(),
+        "energy_share": [round(float(value / energy.sum()), 4) for value in largest.values],
+        "mean_activation": [round(float(activation[:, index].mean()), 3) for index in largest.indices],
+        "output_energy_left": round(float(left), 5),
+        "output_dims": [down[:, index].abs().topk(3).indices.tolist() for index in largest.indices],
+    }
+
+
+def main():
+    r"""
+    Command line: `score`, `parallel` and `generate` evaluate Phase 1 runs, `english-states` caches English
+    backbone states, `capacity` measures per layer second moments,
+    `basis` writes confined correction directions.
+    """
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Phase 1 evaluation and measurement.")
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    capacity = commands.add_parser("capacity", help="Per layer second moments of the deploy and empty frames.")
+    capacity.add_argument("--model", required=True)
+    capacity.add_argument("--adapter", required=True)
+    capacity.add_argument("--output", required=True)
+    capacity.add_argument("--english-speech", required=True)
+    capacity.add_argument("--korean-text", required=True)
+    capacity.add_argument("--korean-speech", required=True)
+    capacity.add_argument("--limit", type=int, default=800)
+    capacity.add_argument("--batch-size", type=int, default=16)
+    capacity.add_argument("--max-frames", type=int, default=320)
+
+    basis = commands.add_parser("basis", help="Input directions of a confined correction, per layer.")
+    basis.add_argument("--moments", required=True)
+    basis.add_argument("--layers", required=True)
+    basis.add_argument("--rank", type=int, default=64)
+    basis.add_argument("--module", default="ffn", choices=CAPACITY_MODULES)
+    basis.add_argument("--output", required=True)
+
+    english = commands.add_parser("english-states", help="Cache of English backbone states for english_lambda.")
+    english.add_argument("--model", required=True)
+    english.add_argument("--corpus", required=True)
+    english.add_argument("--output", required=True)
+    english.add_argument("--batch-size", type=int, default=8)
+    english.add_argument("--limit", type=int, default=0)
+    english.add_argument("--device", default="cuda")
+    english.add_argument("--persona", default="You are a helpful assistant.")
+    english.add_argument("--score-all-frames", action="store_true")
+    english.add_argument("--drop-audio", action="store_true")
+
+    score = commands.add_parser("score", help="Korean, English and timing losses of Phase 1 runs.")
+    score.add_argument("--model", required=True)
+    score.add_argument("--korean", required=True)
+    score.add_argument("--drop-audio", action="store_true")
+    score.add_argument("--exclude-train")
+    score.add_argument("--english-speech", required=True)
+    score.add_argument("--batch-size", type=int, default=16)
+    score.add_argument("--max-frames", type=int, default=320)
+    score.add_argument("runs", nargs="+")
+
+    parallel = commands.add_parser("parallel", help="Korean against English on the same meaning.")
+    parallel.add_argument("--model", required=True)
+    parallel.add_argument("--pairs", required=True)
+    parallel.add_argument("--frames-per-piece", type=float, default=4.049)
+    parallel.add_argument("runs", nargs="+")
+
+    kinds = commands.add_parser("dense-kinds", help="Dense stage loss by kind of target piece.")
+    kinds.add_argument("--model", required=True)
+    kinds.add_argument("--dataset", required=True)
+    kinds.add_argument("--rows", type=int, default=256)
+    kinds.add_argument("--original", action="store_true")
+    kinds.add_argument("runs", nargs="+")
+    dense_gen = commands.add_parser("dense-generate", help="Text continuation in the dense layout of Phase 1.0.")
+    dense_gen.add_argument("--model", required=True)
+    dense_gen.add_argument("--seeds", type=int, default=4)
+    dense_gen.add_argument("--max-new-tokens", type=int, default=80)
+    dense_gen.add_argument("--temperature", type=float, default=0.8)
+    dense_gen.add_argument("run")
+    dense = commands.add_parser("dense-check", help="Leak and context checks of a dense stage checkpoint.")
+    dense.add_argument("--model", required=True)
+    dense.add_argument("--dataset", required=True)
+    dense.add_argument("--train-dataset", required=True)
+    dense.add_argument("--rows", type=int, default=8)
+    dense.add_argument("--seed", type=int, default=0)
+    dense.add_argument("run")
+    generate = commands.add_parser("generate", help="Generation in English, while speaking, and in silence.")
+    generate.add_argument("--model", required=True)
+    generate.add_argument("--steps", type=int, default=120)
+    generate.add_argument("--seeds", type=int, default=2)
+    generate.add_argument("--frames-per-piece", type=float, default=4.049)
+    generate.add_argument("run")
+
+    speak = commands.add_parser("speak", help="Whether the generated speech says the generated text.")
+    speak.add_argument("--model", required=True)
+    speak.add_argument("--steps", type=int, default=200)
+    speak.add_argument("--seeds", type=int, default=2)
+    speak.add_argument("--frames-per-piece", type=float, default=4.049)
+    speak.add_argument("--whisper", default="openai/whisper-large-v3")
+    speak.add_argument("--save-dir")
+    speak.add_argument("run")
+
+    audio = commands.add_parser("audio-loss", help="Cross entropy of the assistant's codes, Korean and English.")
+    audio.add_argument("--model", required=True)
+    audio.add_argument("--korean", required=True)
+    audio.add_argument("--english-speech", required=True)
+    audio.add_argument("--whisper", default="openai/whisper-large-v3")
+    audio.add_argument("--limit", type=int, default=256)
+    audio.add_argument("--batch-size", type=int, default=16)
+    audio.add_argument("--max-frames", type=int, default=512)
+    audio.add_argument("runs", nargs="+")
+
+    baselines = commands.add_parser("dense-baselines", help="Unigram and input scale reference points of the dense check.")
+    baselines.add_argument("--personaplex", default="nvidia/personaplex-7b-v1")
+    baselines.add_argument("--language-model", default="Qwen/Qwen3-8B")
+    baselines.add_argument("--work-dir", required=True)
+    baselines.add_argument("--eval-rows", type=int, default=64)
+    baselines.add_argument("--train-tokens", type=int, default=2_000_000)
+    baselines.add_argument("--output", required=True)
+    nvfp4 = commands.add_parser("nvfp4-check", help="Text loss of a causal LM in full precision and emulated NVFP4.")
+    nvfp4.add_argument("--model", default="Qwen/Qwen3-8B")
+    nvfp4.add_argument("--languages", default="en,ko", help="Comma separated keys of the dense sources.")
+    nvfp4.add_argument("--rows", type=int, default=4, help="Rows per language.")
+    nvfp4.add_argument("--row-tokens", type=int, default=512)
+    nvfp4.add_argument("--variants", default=None, help="Semicolon separated names of NVFP4_VARIANTS to run; all when omitted.")
+    nvfp4.add_argument("--output", required=True)
+    upload = commands.add_parser("speak-upload", help="Put the audio of an `evaluate speak` run on W&B.")
+    upload.add_argument("--log", required=True)
+    upload.add_argument("--audio-dir", required=True)
+    upload.add_argument("--run-id", required=True, help="W&B id of the training run the checkpoint came from.")
+    upload.add_argument("--name", help="Name of the evaluation run, `<training run>-speak` by default.")
+    upload.add_argument("--project", default=os.environ.get("WANDB_PROJECT", "polyplex"))
+    upload.add_argument("--entity", default=os.environ.get("WANDB_ENTITY"))
+    upload.add_argument("--key", default="speak/samples")
+    upload.add_argument("--sampling-rate", type=int, default=24000)
+
+    arguments = parser.parse_args()
+    if arguments.command == "nvfp4-check":
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+
+        from .phase import dense_documents
+
+        tokenizer = AutoTokenizer.from_pretrained(arguments.model)
+        model = AutoModelForCausalLM.from_pretrained(arguments.model, dtype=torch.float32).eval()
+        results = {}
+        for language in arguments.languages.split(","):
+            pieces = []
+            for text in dense_documents(language, "valid", arguments.rows * arguments.row_tokens * 2, tokenizer):
+                pieces += tokenizer.encode(" ".join(text.split()), add_special_tokens=False)
+            rows = [pieces[start : start + arguments.row_tokens] for start in range(0, len(pieces), arguments.row_tokens)]
+            rows = [row for row in rows if len(row) == arguments.row_tokens][: arguments.rows]
+            chosen = None
+            if arguments.variants:
+                chosen = {name.strip(): NVFP4_VARIANTS[name.strip()] for name in arguments.variants.split(";")}
+            results[language] = nvfp4_variant_losses(model, rows, chosen)
+            print(f"[nvfp4-check] {language} {len(rows)} rows of {arguments.row_tokens}: "
+                  + ", ".join(f"{name} {value:.4f}" for name, value in results[language].items()), flush=True)
+        os.makedirs(os.path.dirname(os.path.abspath(arguments.output)), exist_ok=True)
+        with open(arguments.output, "w", encoding="utf-8") as sink:
+            json.dump(results, sink, indent=2)
+        return
+    if arguments.command == "dense-baselines":
+        results = dense_baselines(
+            arguments.personaplex,
+            arguments.language_model,
+            arguments.work_dir,
+            eval_rows=arguments.eval_rows,
+            train_tokens=arguments.train_tokens,
+        )
+        os.makedirs(os.path.dirname(os.path.abspath(arguments.output)), exist_ok=True)
+        with open(arguments.output, "w", encoding="utf-8") as sink:
+            json.dump(results, sink, indent=2)
+        print(json.dumps(results["input_norms"]), flush=True)
+        return
+    if arguments.command == "speak-upload":
+        import wandb
+
+        records = read_speak_log(arguments.log)
+        openings = {opening: index for index, opening in enumerate(GENERATION_OPENINGS)}
+        table = wandb.Table(columns=["opening", "seed", "cer", "text", "heard", "audio"])
+        for record in records:
+            path = os.path.join(arguments.audio_dir, f"{openings[record['opening']]:02d}_{record['seed']}.wav")
+            table.add_data(
+                record["opening"], record["seed"], record["cer"], record.get("text", ""), record.get("heard", ""),
+                wandb.Audio(path, sample_rate=arguments.sampling_rate, caption=record.get("text", "")),
+            )
+        from .train import git_record
+
+        # A run of its own rather than a resumed training run, whose recorded commit a resume would replace.
+        source = wandb.Api().run(f"{arguments.entity}/{arguments.project}/{arguments.run_id}")
+        run = wandb.init(
+            project=arguments.project,
+            entity=arguments.entity,
+            name=arguments.name or f"{source.name}-speak",
+            job_type="eval",
+            tags=sorted(set(source.tags) | {"speak"}),
+            config={"record/source_run": source.url, "record/log": arguments.log, **git_record()},
+        )
+        run.log({arguments.key: table})
+        print(f"[speak-upload] {len(records)} samples -> {run.url}", flush=True)
+        run.finish()
+        return
+    if arguments.command == "score":
+        scorer = Phase1Scorer(arguments.model, arguments.batch_size, arguments.max_frames)
+        korean, characters = scorer.korean_items(arguments.korean, arguments.exclude_train)
+        english = scorer.english_items(arguments.english_speech)
+        condition = "silent" if arguments.drop_audio else "own speech"
+        print(f"[score] korean {len(korean)} utterances ({condition})", flush=True)
+        for run in arguments.runs:
+            model = scorer.load_run(run)
+            k = scorer.score_korean(model, korean, arguments.drop_audio)
+            e = scorer.score_english(model, english)
+            print(
+                f"[score] {run.rstrip('/').split('/runs/')[-1]}\n"
+                f"    korean {k['korean']:.3f}  new {k['korean_new']:.3f}  per char {k['korean_sum'] / characters:.3f}"
+                f"  timing {k['timing']:.3f} ({k['timing_cost']:+.3f})  word frames {k['word_frames']}\n"
+                f"    english {e['english']:.3f} ({e['english_cost']:+.3f})"
+                f"  drift word {e['drift_word']:.4f} timing {e['drift_timing']:.4f}",
+                flush=True,
+            )
+            del model
+            torch.cuda.empty_cache()
+    elif arguments.command == "parallel":
+        scorer = Phase1Scorer(arguments.model)
+        with open(arguments.pairs) as handle:
+            pairs = json.load(handle)
+        print(f"[parallel] {len(pairs)} pairs", flush=True)
+        for run in arguments.runs:
+            model = scorer.load_run(run)
+            r = scorer.score_parallel(model, pairs, arguments.frames_per_piece)
+            k, off, on = r["korean"], r["english_off"], r["english_on"]
+            print(
+                f"[parallel] {run.rstrip('/').split('/runs/')[-1]}\n"
+                f"    korean {k['per_token']:.3f} ({k['per_sentence']:.1f} per sentence)  english off "
+                f"{off['per_token']:.3f} ({off['per_sentence']:.1f})  on {on['per_token']:.3f} "
+                f"({on['per_sentence']:.1f}, {on['per_token'] - off['per_token']:+.3f})",
+                flush=True,
+            )
+            del model
+            torch.cuda.empty_cache()
+    elif arguments.command == "generate":
+        scorer = Phase1Scorer(arguments.model)
+        adapter = scorer.load_run(arguments.run)
+        model = adapter.fold_into_base().to("cuda", torch.bfloat16).eval()
+        print("######## english, corrections on / off", flush=True)
+        for seed in range(arguments.seeds + 1):
+            on = scorer.generate(model, arguments.steps, seed)
+            with adapter.corrections_disabled():
+                off = scorer.generate(model, arguments.steps, seed)
+            print(f"[english #{seed}] same={on == off}\n    on : {on}\n    off: {off}", flush=True)
+        for label, silent in (("speaking", False), ("silent", True)):
+            print(f"######## {label}", flush=True)
+            pairs = []
+            for opening in GENERATION_OPENINGS:
+                stream = scorer.opening_stream(opening.split(), arguments.frames_per_piece)
+                for seed in range(arguments.seeds):
+                    text = scorer.generate(model, arguments.steps, seed, stream, silent)
+                    pairs.append((opening, text))
+                    print(f"[{label} '{opening}' #{seed}] {text}", flush=True)
+            metrics = generation_metrics(pairs)
+            print(
+                f"[{label} metrics] {len(pairs)} outputs  english {metrics['english']:.2f}  sentence end "
+                f"{metrics['sentence_end']:.2f}  repeat {metrics['repeat']:.2f}  long number "
+                f"{metrics['long_number']:.2f}",
+                flush=True,
+            )
+    elif arguments.command == "audio-loss":
+        import torchaudio
+        from transformers import WhisperForConditionalGeneration, WhisperProcessor
+
+        from ..datasets.duplex_data import DuplexUtteranceDataset, duplex_collate_fn
+        from ..datasets.duplex_data import whisper_alignment
+
+        scorer = Phase1Scorer(arguments.model)
+        korean = DuplexUtteranceDataset(arguments.korean)
+        korean = [korean[i] for i in range(min(arguments.limit, len(korean)))]
+        english = scorer.english_items(arguments.english_speech)[: arguments.limit]
+        # The English set carries no word times, so they are read off the decoded speech the way the Korean
+        # speaking data was timed.
+        recognizer_processor = WhisperProcessor.from_pretrained(arguments.whisper)
+        recognizer = WhisperForConditionalGeneration.from_pretrained(
+            arguments.whisper, torch_dtype=torch.float16, attn_implementation="eager"
+        ).to("cuda").eval()
+        resample = torchaudio.transforms.Resample(scorer.processor.audio_tokenizer.config.sampling_rate, 16000)
+        for start in range(0, len(english), arguments.batch_size):
+            chunk = english[start : start + arguments.batch_size]
+            with torch.no_grad():
+                waveforms = [
+                    resample(scorer.processor.decode_audio(item["codes"][None].cuda()).float().cpu()[0, 0]).numpy()
+                    for item in chunk
+                ]
+            aligned = whisper_alignment(
+                recognizer, recognizer_processor, waveforms, [" ".join(item["words"]) for item in chunk], language="en"
+            )
+            for item, (starts, _, _) in zip(chunk, aligned):
+                item["starts"] = starts
+        del recognizer
+        torch.cuda.empty_cache()
+
+        for run in arguments.runs:
+            adapter = scorer.load_run(run).eval()
+            collate = duplex_collate_fn(
+                scorer.processor, adapter.model, drop_audio=False, max_frames=arguments.max_frames, audio_labels=True
+            )
+
+            def mean_loss(items):
+                total = count = 0.0
+                for start in range(0, len(items), arguments.batch_size):
+                    batch = collate(items[start : start + arguments.batch_size])
+                    batch.pop("text_labels", None)
+                    batch = {key: value.cuda() if torch.is_tensor(value) else value for key, value in batch.items()}
+                    with torch.no_grad():
+                        loss = adapter(**batch).loss.item()
+                    total += loss * len(items[start : start + arguments.batch_size])
+                    count += len(items[start : start + arguments.batch_size])
+                return total / max(1.0, count)
+
+            korean_on = mean_loss(korean)
+            english_on = mean_loss(english)
+            with adapter.corrections_disabled():
+                korean_off = mean_loss(korean)
+                english_off = mean_loss(english)
+            print(
+                f"[audio-loss] {run.rstrip('/').split('/runs/')[-1]}  (corrections on / off, uniform {math.log(2048):.3f})\n"
+                f"    korean {korean_on:.3f} / {korean_off:.3f}  english {english_on:.3f} / {english_off:.3f}",
+                flush=True,
+            )
+            del adapter
+            torch.cuda.empty_cache()
+    elif arguments.command == "speak":
+        import torchaudio
+        from transformers import WhisperForConditionalGeneration, WhisperProcessor
+
+        scorer = Phase1Scorer(arguments.model)
+        adapter = scorer.load_run(arguments.run)
+        model = adapter.fold_into_base().to("cuda", torch.bfloat16).eval()
+        recognizer_processor = WhisperProcessor.from_pretrained(arguments.whisper)
+        recognizer = WhisperForConditionalGeneration.from_pretrained(arguments.whisper, torch_dtype=torch.float16).to("cuda").eval()
+        rate = scorer.processor.audio_tokenizer.config.sampling_rate
+        resample = torchaudio.transforms.Resample(rate, 16000)
+        if arguments.save_dir:
+            import soundfile
+
+            os.makedirs(arguments.save_dir, exist_ok=True)
+        errors = []
+        for index, opening in enumerate(GENERATION_OPENINGS):
+            stream = scorer.opening_stream(opening.split(), arguments.frames_per_piece)
+            for seed in range(arguments.seeds):
+                text, codes = scorer.generate(model, arguments.steps, seed, stream, return_codes=True)
+                with torch.no_grad():
+                    waveform = scorer.processor.decode_audio(codes[None]).float().cpu()[0, 0]
+                    features = recognizer_processor(
+                        resample(waveform).numpy(), sampling_rate=16000, return_tensors="pt"
+                    ).input_features.to("cuda", torch.float16)
+                    ids = recognizer.generate(features, language="korean", task="transcribe")
+                heard = recognizer_processor.batch_decode(ids, skip_special_tokens=True)[0].strip()
+                error = character_error_rate(text, heard)
+                errors.append(error)
+                if arguments.save_dir:
+                    soundfile.write(os.path.join(arguments.save_dir, f"{index:02d}_{seed}.wav"), waveform.numpy(), rate)
+                print(f"[speak '{opening}' #{seed}] cer {error:.2f}\n    text : {text}\n    heard: {heard}", flush=True)
+        print(f"[speak metrics] {len(errors)} outputs  mean cer {sum(errors) / max(1, len(errors)):.3f}", flush=True)
+    elif arguments.command == "dense-kinds":
+        from ..datasets.duplex_data import dense_collate_fn
+        from ..datasets.phase_data import DenseTextDataset
+
+        scorer = Phase1Scorer(arguments.model)
+        dataset = DenseTextDataset(arguments.dataset)
+        rows = [dataset[i] for i in range(min(arguments.rows, len(dataset)))]
+        for run in arguments.runs:
+            model = scorer.load_run(run)
+            collate = dense_collate_fn(scorer.processor, model.model)
+            if arguments.original:
+                with model.corrections_disabled():
+                    report = piece_kind_scores(model, collate, rows, scorer.processor.tokenizer, base_only=True)
+            else:
+                report = piece_kind_scores(model, collate, rows, scorer.processor.tokenizer)
+            print(f"[dense-kinds] {run}", flush=True)
+            for key, value in sorted(report.items(), key=lambda item: -item[1]["share"]):
+                print(f"    {key:20s} share {value['share']:.3f}  loss {value['loss']:.3f}  ppl {value['ppl']:.1f}  top1 {value['top1']:.3f}", flush=True)
+            del model
+            torch.cuda.empty_cache()
+    elif arguments.command == "dense-generate":
+        from ..datasets.duplex_data import dense_collate_fn
+
+        scorer = Phase1Scorer(arguments.model)
+        model = scorer.load_run(arguments.run)
+        collate = dense_collate_fn(scorer.processor, model.model)
+        tokenizer = scorer.processor.tokenizer
+        for opening in GENERATION_OPENINGS:
+            prompt = torch.tensor(tokenizer.encode(opening, add_special_tokens=False))
+            for seed in range(arguments.seeds):
+                pieces = dense_generate(model, collate, prompt, arguments.max_new_tokens, arguments.temperature, seed=seed)
+                text = tokenizer.decode(pieces.tolist())
+                print(f"[dense '{opening}' #{seed}] {opening}{text}", flush=True)
+    elif arguments.command == "dense-check":
+        from ..datasets.duplex_data import dense_collate_fn
+        from ..datasets.phase_data import DenseTextDataset
+
+        scorer = Phase1Scorer(arguments.model)
+        model = scorer.load_run(arguments.run)
+        dataset = DenseTextDataset(arguments.dataset)
+        rows = [dataset[i] for i in range(arguments.rows)]
+        if len(rows[0]["segments"]) < 2:
+            rows.insert(0, next(dataset[i] for i in range(len(dataset)) if len(dataset[i]["segments"]) > 1))
+        unigram = unigram_log_probs(DenseTextDataset(arguments.train_dataset).tokens, model.config.vocab_size)
+        report = dense_checks(
+            model, dense_collate_fn(scorer.processor, model.model), rows, model.config.base_vocab_size, unigram,
+            arguments.seed,
+        )
+        print(f"[dense-check] {arguments.run}\n    " + "  ".join(f"{k} {v:.4g}" for k, v in report.items()), flush=True)
+    elif arguments.command == "english-states":
+        from .phase import write_english_states
+
+        frames = write_english_states(
+            arguments.model, arguments.corpus, arguments.output, arguments.batch_size, arguments.limit,
+            arguments.device, arguments.persona, arguments.score_all_frames, arguments.drop_audio,
+        )
+        print(f"[english] {frames} frames -> {arguments.output}", flush=True)
+    elif arguments.command == "capacity":
+        report = measure_capacity(
+            arguments.model, arguments.adapter, arguments.output, arguments.english_speech, arguments.korean_text,
+            arguments.korean_speech, arguments.limit, arguments.batch_size, arguments.max_frames,
+        )
+        print(f"[capacity] frames per group {report['counts']} -> {arguments.output}", flush=True)
+    else:
+        count = build_confined_basis(arguments.moments, arguments.layers, arguments.rank, arguments.module, arguments.output)
+        print(f"[basis] {count} layers, rank {arguments.rank} -> {arguments.output}", flush=True)
 
 
 if __name__ == "__main__":
@@ -1253,6 +2299,9 @@ if __name__ == "__main__":
 
 
 __all__ = [
+    "dense_baselines",
+    "dense_unigram_baseline",
+    "frame_embedding_norms",
     "CAPACITY_GROUPS",
     "CapacityMeter",
     "Evaluator",
@@ -1260,5 +2309,10 @@ __all__ = [
     "Phase1Scorer",
     "SilentAssistantLogitsProcessor",
     "build_confined_basis",
+    "dense_checks",
+    "dense_generate",
     "measure_capacity",
+    "piece_kind",
+    "piece_kind_scores",
+    "unigram_log_probs",
 ]
