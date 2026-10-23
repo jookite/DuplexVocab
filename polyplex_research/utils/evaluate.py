@@ -1343,7 +1343,110 @@ _DIGITS = re.compile(r"▁?[0-9]+")
 _LATIN = re.compile("[A-Za-z]")
 
 
+HELDOUT_SPEECH = ".cache/huggingface/runs/data/english_heldout_speech.pt"
 """The held out English speech set (`train.sh` `SCORE_ENGLISH_SPEECH`)."""
+
+
+def heldout_speech_items(path: str = HELDOUT_SPEECH, num_codebooks: int = 8, count: int = 64) -> list:
+    r"""
+    Reads the first `count` examples of the held out English speech set as items for
+    [`~polyplex_research.datasets.duplex_data.duplex_collate_fn`] with the
+    [`~polyplex_research.datasets.duplex_data.packed_words`] layout, built as [`~phase.write_english_states`] builds
+    them: the example's own codes and the words of its text. The set has no word times, so every start is 0.
+
+    Args:
+        path (`str`, *optional*, defaults to [`HELDOUT_SPEECH`]):
+            A `torch.save` of [`~polyplex_research.datasets.base.SingleTurnTTSExample`] with `text` and `codes`.
+        num_codebooks (`int`, *optional*, defaults to 8):
+            Codebooks the model reads per stream, 8 for PersonaPlex.
+        count (`int`, *optional*, defaults to 64):
+            Examples read.
+
+    Returns:
+        `list[dict]`: Items with `codes` (`(num_codebooks, frames)`), `words` and `starts`.
+    """
+    examples = torch.load(path, weights_only=False)[:count]
+    return [
+        {
+            "codes": torch.as_tensor(example.codes)[:num_codebooks].long(),
+            "words": example.text.split(),
+            "starts": [0.0] * len(example.text.split()),
+        }
+        for example in examples
+    ]
+
+
+def speech_losses(model, collate, items: list, byte_lengths: torch.Tensor) -> dict:
+    r"""
+    Teacher forced losses of a duplex model on speech the assistant side speaks: the text stream in bits per byte
+    of the scored tokens, and the depth decoder's cross entropy per codebook. The depth decoder is conditioned on
+    the backbone state of frame `t` and scores the codes of frame `t + 1`, reading that frame's text token and its
+    lower codebooks, the convention of the Phase 1 audio loss. Items run one at a time.
+
+    Args:
+        model ([`PolyplexForConditionalGeneration`] or `PersonaPlexForConditionalGeneration`):
+            The model, in evaluation mode.
+        collate (`Callable`):
+            [`~polyplex_research.datasets.duplex_data.duplex_collate_fn`] of the model, built with
+            `audio_labels=True`.
+        items (`list[dict]`):
+            Items the collator reads, such as [`heldout_speech_items`].
+        byte_lengths (`torch.Tensor`):
+            Bytes of each text id, from [`~polyplex_research.utils.phase.token_byte_lengths`] of the model's
+            tokenizer.
+
+    Returns:
+        `dict`: `text_bits_per_byte` and `text_tokens`; `audio_loss_per_codebook` (nats) and
+        `audio_codes_per_codebook`; `audio_semantic_loss` (codebook 0) and `audio_acoustic_loss` (the others).
+    """
+    import torch.nn.functional as F
+
+    device = next(model.parameters()).device
+    vocab = model.config.vocab_size
+    reserved = model.config.audio_vocab_size
+    text_sum, text_bytes, text_tokens = 0.0, 0, 0
+    audio_sums, audio_counts = None, None
+    for item in items:
+        batch = {key: value.to(device) for key, value in collate([item]).items()}
+        text_labels, audio_labels = batch.pop("text_labels"), batch.pop("audio_labels")
+        with torch.no_grad():
+            output = model(**batch, use_cache=False)
+            labels = text_labels[:, 1:]
+            scored = labels != -100
+            logits = output.logits[:, :-1, :vocab].float()
+            text_sum += F.cross_entropy(logits[scored], labels[scored], reduction="sum").item()
+            text_bytes += int(byte_lengths[labels[scored].cpu()].sum())
+            text_tokens += int(scored.sum())
+
+            codebooks = audio_labels.shape[1]
+            targets = audio_labels[:, :, 1:].transpose(1, 2).reshape(-1, codebooks)
+            targets = targets.masked_fill(targets == reserved, -100)
+            kept = (targets != -100).any(dim=-1)
+            text = batch["input_ids"][:, 1:].reshape(-1, 1)[kept]
+            codes = batch["assistant_audio_codes"][:, :, 1:].transpose(1, 2).reshape(-1, codebooks)[kept]
+            codes = codes.masked_fill(codes == -100, reserved)
+            hidden = output.last_hidden_state
+            states = hidden[:, :-1].reshape(-1, hidden.shape[-1])[kept].unsqueeze(1)
+            depth = model.depth_decoder(
+                last_hidden_state=states, input_ids=torch.cat([text, codes[:, :-1]], dim=1)
+            ).logits.float()
+        targets = targets[kept]
+        if audio_sums is None:
+            audio_sums, audio_counts = [0.0] * codebooks, [0] * codebooks
+        for codebook in range(codebooks):
+            target = targets[:, codebook].to(depth.device)
+            valid = target != -100
+            audio_sums[codebook] += F.cross_entropy(depth[:, codebook][valid], target[valid], reduction="sum").item()
+            audio_counts[codebook] += int(valid.sum())
+    per_codebook = [total / max(count, 1) for total, count in zip(audio_sums, audio_counts)]
+    return {
+        "text_bits_per_byte": text_sum / math.log(2) / max(text_bytes, 1),
+        "text_tokens": text_tokens,
+        "audio_loss_per_codebook": per_codebook,
+        "audio_codes_per_codebook": audio_counts,
+        "audio_semantic_loss": per_codebook[0],
+        "audio_acoustic_loss": sum(audio_sums[1:]) / max(sum(audio_counts[1:]), 1),
+    }
 
 
 def piece_kind(piece: str, previous: str | None) -> str:
@@ -2302,6 +2405,7 @@ __all__ = [
     "dense_baselines",
     "dense_unigram_baseline",
     "frame_embedding_norms",
+    "heldout_speech_items",
     "CAPACITY_GROUPS",
     "CapacityMeter",
     "Evaluator",
@@ -2314,5 +2418,6 @@ __all__ = [
     "measure_capacity",
     "piece_kind",
     "piece_kind_scores",
+    "speech_losses",
     "unigram_log_probs",
 ]
