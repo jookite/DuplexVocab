@@ -15,42 +15,68 @@
 
 from __future__ import annotations
 
-from transformers.models.qwen2.tokenization_qwen2 import Qwen2Tokenizer
+import unicodedata
+
+from tokenizers import Tokenizer, decoders, normalizers, pre_tokenizers
+from tokenizers.models import Unigram
+from transformers.tokenization_utils_tokenizers import PreTrainedTokenizerFast
 
 
-VOCAB_FILES_NAMES = {
-    "vocab_file": "vocab.json",
-    "merges_file": "merges.txt",
-    "tokenizer_file": "tokenizer.json",
-}
+VOCAB_FILES_NAMES = {"tokenizer_file": "tokenizer.json"}
 
-# The byte-level mark Qwen3 puts on a piece that opens a word, the byte of a space read through the byte map.
-WORD_START = "Ġ"
+WORD_START = "▁"
 
 
-class PolyplexTokenizer(Qwen2Tokenizer):
+def sentencepiece_pieces(model_file: str) -> list:
     r"""
-    Constructs a Polyplex tokenizer, the byte-level BPE tokenizer of Qwen3 with the vocabulary of the duplex
-    checkpoint kept beside it.
-
-    The text backbone reads Qwen3's pieces, so the tokenizer is Qwen3's: the same pre-tokenization regex, the same
-    byte map and the same merges. Ids past Qwen3's vocabulary are grouped into blocks, and `blocks` records where
-    each block starts and ends so the rows a block owns can be found from the tokenizer alone.
+    Reads a SentencePiece model in id order.
 
     Args:
-        vocab (`str` or `dict[str, int]`, *optional*):
-            Piece mapped to its id, or the path of a `vocab.json`.
-        merges (`str` or `list[str]`, *optional*):
-            The BPE merges in rank order, or the path of a `merges.txt`.
+        model_file (`str`):
+            Path of the `.model` file.
+
+    Returns:
+        `list[tuple[str, float, str]]`: Each piece with its score and its kind, one of `"unknown"`, `"control"`,
+        `"byte"` and `"normal"`.
+    """
+    import sentencepiece
+
+    model = sentencepiece.SentencePieceProcessor(model_file=model_file)
+    pieces = []
+    for index in range(model.get_piece_size()):
+        if model.is_unknown(index):
+            kind = "unknown"
+        elif model.is_control(index):
+            kind = "control"
+        elif model.is_byte(index):
+            kind = "byte"
+        else:
+            kind = "normal"
+        pieces.append((model.id_to_piece(index), model.get_score(index), kind))
+    return pieces
+
+
+class PolyplexTokenizer(PreTrainedTokenizerFast):
+    r"""
+    Constructs a Polyplex tokenizer, a SentencePiece Unigram tokenizer with byte fallback over the Helium, Qwen3 and
+    added vocabulary (SPEC S12.1, S12.1a).
+
+    Helium's tokens keep their ids, so `EPAD` is 0 and `PAD` is 3. The ids after them are grouped into blocks, the
+    base block first and then one block per script; `blocks` records where each block starts and ends.
+
+    Args:
+        vocab (`list[tuple[str, float]]`, *optional*):
+            Every piece in id order with its Unigram score. The tokenizer is built from it: NFC, the spaces turned
+            into `▁` with one in front, Unigram segmentation with byte fallback.
         blocks (`dict`, *optional*):
             Block name mapped to its `[start, end)` id range.
-        unk_token (`str`, *optional*, defaults to `"<|endoftext|>"`):
-            Token standing for a piece the vocabulary does not hold. Byte-level BPE never needs it.
-        bos_token (`str`, *optional*):
-            Token opening a sequence. Qwen3 opens none.
-        eos_token (`str`, *optional*, defaults to `"<|endoftext|>"`):
+        unk_token (`str`, *optional*, defaults to `"<unk>"`):
+            Token standing for a piece the vocabulary does not hold.
+        bos_token (`str`, *optional*, defaults to `"<s>"`):
+            Token opening a sequence.
+        eos_token (`str`, *optional*, defaults to `"</s>"`):
             Token closing a sequence.
-        pad_token (`str`, *optional*, defaults to `"<|endoftext|>"`):
+        pad_token (`str`, *optional*, defaults to `"<pad>"`):
             Token filling a batch to its width.
         split_special_tokens (`bool`, *optional*, defaults to `True`):
             Whether a control token's string inside text is cut as text rather than read as the control token.
@@ -58,23 +84,35 @@ class PolyplexTokenizer(Qwen2Tokenizer):
 
     vocab_files_names = VOCAB_FILES_NAMES
     model_input_names = ["input_ids", "attention_mask"]
+    model = Unigram
 
     def __init__(
         self,
-        vocab: str | dict[str, int] | None = None,
-        merges: str | list[str] | None = None,
+        vocab: list | None = None,
         blocks: dict | None = None,
-        unk_token: str = "<|endoftext|>",
-        bos_token: str | None = None,
-        eos_token: str = "<|endoftext|>",
-        pad_token: str = "<|endoftext|>",
+        unk_token: str = "<unk>",
+        bos_token: str = "<s>",
+        eos_token: str = "</s>",
+        pad_token: str = "<pad>",
         split_special_tokens: bool = True,
         clean_up_tokenization_spaces: bool = False,
         **kwargs,
     ):
+        if vocab is not None:
+            vocab = [(piece, score) for piece, score in vocab]
+            unk_id = next(index for index, (piece, _) in enumerate(vocab) if piece == str(unk_token))
+            self._tokenizer = Tokenizer(Unigram(vocab, unk_id=unk_id, byte_fallback=True))
+            # The layout `transformers` gives Helium's SentencePiece model, with NFC in front (SPEC S12.1).
+            self._tokenizer.normalizer = normalizers.Sequence(
+                [normalizers.NFC(), normalizers.Replace(" ", WORD_START)]
+            )
+            self._tokenizer.pre_tokenizer = pre_tokenizers.Metaspace(
+                replacement=WORD_START, prepend_scheme="first", split=False
+            )
+            self._tokenizer.decoder = decoders.Sequence(
+                [decoders.Replace(WORD_START, " "), decoders.ByteFallback(), decoders.Fuse(), decoders.Strip(" ", 1, 0)]
+            )
         super().__init__(
-            vocab=vocab,
-            merges=merges,
             blocks=blocks,
             unk_token=unk_token,
             bos_token=bos_token,
@@ -99,14 +137,13 @@ class PolyplexTokenizer(Qwen2Tokenizer):
             `PolyplexTokenizer`: The wrapped tokenizer.
         """
         defaults = {
-            "unk_token": str(tokenizer.unk_token) if tokenizer.unk_token else "<|endoftext|>",
-            "bos_token": str(tokenizer.bos_token) if tokenizer.bos_token else None,
-            "eos_token": str(tokenizer.eos_token) if tokenizer.eos_token else "<|endoftext|>",
-            "pad_token": str(tokenizer.pad_token) if tokenizer.pad_token else "<|endoftext|>",
+            "unk_token": str(tokenizer.unk_token) if tokenizer.unk_token else "<unk>",
+            "bos_token": str(tokenizer.bos_token) if tokenizer.bos_token else "<s>",
+            "eos_token": str(tokenizer.eos_token) if tokenizer.eos_token else "</s>",
+            "pad_token": str(tokenizer.pad_token) if tokenizer.pad_token else "<pad>",
             "split_special_tokens": False,
         }
         defaults.update(kwargs)
         return cls(tokenizer_object=tokenizer.backend_tokenizer, **defaults)
 
-
-__all__ = ["PolyplexTokenizer", "WORD_START"]
+__all__ = ["PolyplexTokenizer", "sentencepiece_pieces"]
