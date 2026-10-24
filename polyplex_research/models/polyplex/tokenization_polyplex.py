@@ -26,6 +26,65 @@ VOCAB_FILES_NAMES = {"tokenizer_file": "tokenizer.json"}
 
 WORD_START = "▁"
 
+# Scripts read off a character's Unicode name, in the order their blocks follow the base block.
+NAMED_SCRIPTS = (
+    "LATIN", "CYRILLIC", "GREEK", "ARMENIAN", "GEORGIAN", "HEBREW", "ARABIC", "DEVANAGARI", "BENGALI", "GURMUKHI",
+    "GUJARATI", "ORIYA", "TAMIL", "TELUGU", "KANNADA", "MALAYALAM", "SINHALA", "THAI", "LAO", "KHMER", "MYANMAR",
+)
+BLOCK_ORDER = ("base", *(script.lower() for script in NAMED_SCRIPTS), "hangul", "han", "kana", "other", "mixed")
+
+# How far below the lowest text piece a special token is scored. A special token's string is a piece of the Unigram
+# model, and this keeps the segmentation from ever choosing it for text.
+SPECIAL_SCORE_GAP = 1000.0
+
+
+def script_of(character: str) -> str | None:
+    r"""
+    Args:
+        character (`str`):
+            One character.
+
+    Returns:
+        `str` or `None`: The script the character is written in, `None` for digits, punctuation, symbols, spaces
+        and control characters.
+    """
+    code = ord(character)
+    if 0xAC00 <= code <= 0xD7A3 or 0x1100 <= code <= 0x11FF or 0x3130 <= code <= 0x318F:
+        return "hangul"
+    if 0x3040 <= code <= 0x30FF or 0x31F0 <= code <= 0x31FF:
+        return "kana"
+    if 0x4E00 <= code <= 0x9FFF or 0x3400 <= code <= 0x4DBF or 0xF900 <= code <= 0xFAFF or 0x20000 <= code <= 0x2FFFF:
+        return "han"
+    if character.isascii():
+        return "latin" if character.isalpha() else None
+    name = unicodedata.name(character, "")
+    for script in NAMED_SCRIPTS:
+        if name.startswith(script):
+            return script.lower()
+    if unicodedata.category(character)[0] in "PSZNC":
+        return None
+    return "other"
+
+
+def block_of(piece: str) -> str:
+    r"""
+    Args:
+        piece (`str`):
+            A token string, its word-start mark included.
+
+    Returns:
+        `str`: The block the piece belongs to: `"base"` when it holds no letter of any script, the script when it
+        holds one, `"han"` or `"kana"` for Han and kana together, and `"mixed"` for several scripts.
+    """
+    scripts = {script_of(character) for character in piece.replace(WORD_START, "")} - {None}
+    if not scripts:
+        return "base"
+    if scripts <= {"han", "kana"}:
+        return "kana" if "kana" in scripts else "han"
+    if len(scripts) == 1:
+        return next(iter(scripts))
+    return "mixed"
+
 
 def sentencepiece_pieces(model_file: str) -> list:
     r"""
@@ -146,4 +205,53 @@ class PolyplexTokenizer(PreTrainedTokenizerFast):
         defaults.update(kwargs)
         return cls(tokenizer_object=tokenizer.backend_tokenizer, **defaults)
 
-__all__ = ["PolyplexTokenizer", "sentencepiece_pieces"]
+    @classmethod
+    def from_vocabulary(cls, base_pieces: list, pieces: dict, control_tokens: list | tuple = ()) -> "PolyplexTokenizer":
+        r"""
+        Builds the tokenizer of the final vocabulary (SPEC S12.1a).
+
+        The base vocabulary keeps its ids. The control tokens come right after it, then every other piece grouped
+        into blocks: the base block (pieces holding no letter) first, then one block per script in
+        `BLOCK_ORDER`, each ordered by score from the highest.
+
+        Args:
+            base_pieces (`list[tuple[str, float, str]]`):
+                Helium's vocabulary in id order, each piece with its score and kind, as [`sentencepiece_pieces`]
+                reads it.
+            pieces (`dict`):
+                Every text piece of the final vocabulary mapped to its Unigram score. A base piece found here
+                takes this score.
+            control_tokens (`list[str]`, *optional*):
+                Control tokens added after the base vocabulary.
+
+        Returns:
+            `PolyplexTokenizer`: The tokenizer, with `blocks` set.
+        """
+        texts = [score for piece, score, kind in base_pieces if kind == "normal"] + list(pieces.values())
+        special_score = min(texts) - SPECIAL_SCORE_GAP
+        specials = [piece for piece, _, kind in base_pieces if kind in ("unknown", "control")]
+        vocab = []
+        for piece, score, kind in base_pieces:
+            if kind == "normal":
+                vocab.append((piece, pieces.get(piece, score)))
+            else:
+                vocab.append((piece, special_score if kind in ("unknown", "control") else 0.0))
+        vocab += [(token, special_score) for token in control_tokens]
+        held = {piece for piece, _ in vocab}
+        grouped = {}
+        for piece, score in pieces.items():
+            if piece not in held:
+                grouped.setdefault(block_of(piece), []).append((piece, score))
+
+        blocks = {"base": [0, len(vocab) + len(grouped.get("base", []))]}
+        for name in BLOCK_ORDER:
+            members = sorted(grouped.get(name, []), key=lambda item: (-item[1], item[0]))
+            if name != "base" and members:
+                blocks[name] = [len(vocab), len(vocab) + len(members)]
+            vocab += members
+
+        names = dict(zip(("unk_token", "bos_token", "eos_token", "pad_token"), specials))
+        return cls(vocab=vocab, blocks=blocks, additional_special_tokens=list(control_tokens), **names)
+
+
+__all__ = ["BLOCK_ORDER", "PolyplexTokenizer", "block_of", "script_of", "sentencepiece_pieces"]
